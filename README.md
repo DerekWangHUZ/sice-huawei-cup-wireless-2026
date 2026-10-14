@@ -8,7 +8,7 @@
 
 本项目面向无线通信与通感一体前沿技术，设计并实现了一套**通感一体的异构边缘智算系统**：
 * **空口通感一体**：废除外置独立 Wi-Fi 信标，直接复用移动穿戴端回传 IMU 姿态数据的 UDP 射频报文作为空间多径激励源。同一空中数据流，既承担传感器通信功能，又充当 CSI 空间感知信标。
-* **异构边缘计算**：ESP32-S3 担任感知主控与网络中枢，STM32 协同解算运动学姿态，Artix-7 FPGA 负责硬件级快速响应与声光告警，ESP32-CAM 负责事件触发抓拍，实现多层次异构边缘协同。
+* **异构边缘计算**：ESP32-S3 担任感知主控与网络中枢，Artix-7 FPGA 负责硬件级快速响应与声光告警，ESP32-CAM 负责事件触发抓拍，实现多层次异构边缘协同。
 
 ---
 
@@ -21,9 +21,7 @@
 ├── firmware/                   # 嵌入式固件工程源码
 │   ├── base_station/           # [成员 A] ESP32-S3 核心主控工程 (SoftAP / CSI提取 / SD / OLED)
 │   ├── wearable/               # [成员 B] ESP32-CAM 穿戴标签工程 (MPU6050 / UDP推流 / 抓拍)
-│   └── coprocessors/           # [成员 A] 协处理器工程
-│       ├── stm32/              # STM32 NUCLEO-F401 姿态解算工程
-│       └── fpga/               # Artix-7 FPGA 串口接收、数码管驱动与蜂鸣器告警工程
+│   └── coprocessor/           # [成员 A] Artix-7 FPGA 协处理器工程
 │
 ├── algorithm/                  # [成员 C] 算法与数据处理
 │   └── (离线分析脚本与特征提取逻辑)
@@ -34,7 +32,11 @@
 │
 ├── docs/                       # 项目协作规范与参赛文档
 │   ├── 团队分工与异步协作方案.md  # 三人包干范围、自测手段与交付矩阵
-│   └── 团队协作规范与接口契约.md  # Wi-Fi参数、18字节UDP协议定义与交接规范
+│   ├── 团队协作规范与接口契约.md  # Wi-Fi参数、18字节UDP协议定义与交接规范
+│   ├── 成员A任务状态.md          # 成员 A 负责部分的当前状态
+│   ├── FPGA实验板资料参考.md     # FPGA 实验板引脚与片上资源约束
+│   ├── Vivado工程移植方案.md     # FPGA 工程移植与版本管理方案
+│   └── CHANGELOG.md             # 架构级变更记录与决策依据
 │
 ├── data/                       # 标准测试数据集 (样本 CSV)
 │
@@ -70,8 +72,10 @@
 1. **查阅分工与契约**：在开展具体开发前，请务必详细阅读 `docs/` 目录下的：
    * [团队分工与异步协作方案.md](docs/团队分工与异步协作方案.md)
    * [团队协作规范与接口契约.md](docs/团队协作规范与接口契约.md)
+   * [CHANGELOG.md](docs/CHANGELOG.md)（架构变更与决策依据）
+   * [Vivado工程移植方案.md](docs/Vivado工程移植方案.md)（FPGA 工程移植与版本管理）
 2. **各子目录独立提交**：
-   * 成员 A 仅维护 `firmware/base_station` 与 `firmware/coprocessors`；
+   * 成员 A 仅维护 `firmware/base_station` 与 `firmware/coprocessor`；
    * 成员 B 仅维护 `firmware/wearable`；
    * 成员 C 仅维护 `algorithm`、`data` 与 `docs`。
    各人提交互不交叉，天然避免代码冲突。

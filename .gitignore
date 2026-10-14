@@ -15,21 +15,26 @@ build/
 sdkconfig.old
 
 # ==========================================
-# STM32CubeIDE / GCC
+# C / C++ 编译产物（任何 GCC / Clang 工程通用）
 # ==========================================
-Debug/
-Release/
 *.o
 *.d
 
 # ==========================================
-# Xilinx Vivado (FPGA 临时工程产物)
+# Xilinx Vivado
 # ==========================================
+# .xpr 为 Vivado 工程状态快照，内部写死绝对路径，
+# 换机器不可用，故不入库；工程由 rebuild.tcl 重建。
+# 详见 docs/Vivado工程移植方案.md
+*.xpr
+
+# Vivado 运行缓存与实现产物
 *.runs/
 *.cache/
 *.hw/
 *.ip_user_files/
 *.sim/
+.Xil/
 *.log
 *.jou
 *.str
