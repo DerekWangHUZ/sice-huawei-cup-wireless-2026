@@ -40,6 +40,18 @@ sdkconfig.old
 *.str
 *.bit.bin
 
+# Vivado xsim 无头仿真产物（sim/ 下源文件保留，运行产物不入库）
+xsim.dir/
+*.wdb
+*.pb
+hs_err_pid*
+
+# 宿主离线自测产物（gen_frames.py 可重新生成；日志仅本机查阅）
+firmware/base_station/tools/offline_test/data/
+firmware/base_station/tools/offline_test/logs/
+firmware/base_station/tools/offline_test/test_harness.exe
+firmware/base_station/tools/offline_test/test_harness.obj
+
 # ==========================================
 # Python 数据处理环境
 # ==========================================

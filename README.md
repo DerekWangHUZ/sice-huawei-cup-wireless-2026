@@ -20,8 +20,13 @@
 .
 ├── firmware/                   # 嵌入式固件工程源码
 │   ├── base_station/           # [成员 A] ESP32-S3 核心主控工程 (SoftAP / CSI提取 / SD / OLED)
+│   │   ├── main/               #    固件源码（fall_core 判定核心 / fpga_link / csi_stub）
+│   │   └── tools/offline_test/ #    离线自测与上板发假包工具（无板可跑）
 │   ├── wearable/               # [成员 B] ESP32-CAM 穿戴标签工程 (MPU6050 / UDP推流 / 抓拍)
-│   └── coprocessor/           # [成员 A] Artix-7 FPGA 协处理器工程
+│   └── coprocessor/            # [成员 A] Artix-7 FPGA 协处理器工程
+│       ├── rtl/                #    RTL 源码（uart_rx / cmd_decoder / seg_display / buzzer_ctrl / top）
+│       ├── constrs/            #    引脚约束
+│       └── sim/                #    testbench + 无头仿真脚本（run_sim.ps1）
 │
 ├── algorithm/                  # [成员 C] 算法与数据处理
 │   └── (离线分析脚本与特征提取逻辑)
@@ -32,7 +37,7 @@
 │
 ├── docs/                       # 项目协作规范与参赛文档
 │   ├── 团队分工与异步协作方案.md  # 三人包干范围、自测手段与交付矩阵
-│   ├── 团队协作规范与接口契约.md  # Wi-Fi参数、18字节UDP协议定义与交接规范
+│   ├── 团队协作规范与接口契约.md  # Wi-Fi参数、18字节UDP协议、S3↔FPGA控制帧协议(§四)
 │   ├── 成员A任务状态.md          # 成员 A 负责部分的当前状态
 │   ├── FPGA实验板资料参考.md     # FPGA 实验板引脚与片上资源约束
 │   ├── Vivado工程移植方案.md     # FPGA 工程移植与版本管理方案

@@ -62,7 +62,7 @@ set_property PULLUP true [get_ports rst_n]
 
 ---
 
-## 4. UART（可用，master 中默认注释）
+## 4. UART（板上 USB-UART 桥）
 
 ```tcl
 # set_property PACKAGE_PIN F12 [get_ports txd]
@@ -70,7 +70,12 @@ set_property PULLUP true [get_ports rst_n]
 # set_property PACKAGE_PIN F13 [get_ports rxd]
 # set_property IOSTANDARD  LVCMOS33 [get_ports rxd]
 ```
-- `txd → F12`，`rxd → F13`（LVCMOS33）。课程 master 资源文件里以 `#` 注释，需要时取消注释即可。
+- `txd → F12`，`rxd → F13`（LVCMOS33）。F12/F13 接**板上 USB-UART 桥**
+  （板右侧独立 UART USB 口，与 JTAG 口并排），供 PC 串口通信使用，
+  **未引出至排针**；外部设备对接 UART 请使用扩展排母的空闲引脚。
+- 本项目（`firmware/coprocessor`）S3 → FPGA 的 rxd 使用扩展排母
+  **B15**（右排母上排第 1 脚，同排末位 GND），约束见
+  `firmware/coprocessor/constrs/pins.xdc`。
 
 ---
 
