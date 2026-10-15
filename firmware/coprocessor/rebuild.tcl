@@ -23,8 +23,8 @@
 # 2. The following source(s) files that were local or imported into the original project.
 #    (Please see the '$orig_proj_dir' and '$origin_dir' variable setting below at the start of the script)
 #
-#    "<PROJECT_DIR>/coprocessor.srcs/sources_1/new/top.v"
-#    "<PROJECT_DIR>/coprocessor.srcs/constrs_1/new/pins.xdc"
+#    "<PROJECT_DIR>/rtl/top.v"
+#    "<PROJECT_DIR>/constrs/pins.xdc"
 #
 # 3. The following remote source files that were added to the original project:-
 #
@@ -36,8 +36,8 @@
 proc checkRequiredFiles { origin_dir} {
   set status true
   set files [list \
- "[file normalize "$origin_dir/coprocessor.srcs/sources_1/new/top.v"]"\
- "[file normalize "$origin_dir/coprocessor.srcs/constrs_1/new/pins.xdc"]"\
+ "[file normalize "$origin_dir/rtl/top.v"]"\
+ "[file normalize "$origin_dir/constrs/pins.xdc"]"\
   ]
   foreach ifile $files {
     if { ![file isfile $ifile] } {
@@ -127,7 +127,10 @@ if { $validate_required } {
 }
 
 # Create project
-create_project ${_xil_proj_name_} ./${_xil_proj_name_} -part xc7a35tftg256-1
+# 2026-10-15: 工程建在当前目录（firmware/coprocessor/coprocessor.xpr），
+# 与仓库既有布局一致；不要改回 ./${_xil_proj_name_}/ 子目录，否则
+# 生成的工程路径和实际打开路径对不上。
+create_project ${_xil_proj_name_} . -part xc7a35tftg256-1 -force
 
 # Set the directory path for the new project
 set proj_dir [get_property directory [current_project]]
@@ -159,8 +162,16 @@ if {[string equal [get_filesets -quiet sources_1] ""]} {
 # Set 'sources_1' fileset object
 set obj [get_filesets sources_1]
 # Add local files from the original project (-no_copy_sources specified)
+# NOTE: file list updated 2026-10-15 for the fall-detect alarm chain.
+#       uart_rx / cmd_decoder / seg_display / buzzer_ctrl added alongside top.
+#       Keep in sync with rtl/*.v -- adding or
+#       removing a source file requires re-exporting this script.
 set files [list \
- [file normalize "${origin_dir}/coprocessor.srcs/sources_1/new/top.v" ]\
+ [file normalize "${origin_dir}/rtl/uart_rx.v" ]\
+ [file normalize "${origin_dir}/rtl/cmd_decoder.v" ]\
+ [file normalize "${origin_dir}/rtl/seg_display.v" ]\
+ [file normalize "${origin_dir}/rtl/buzzer_ctrl.v" ]\
+ [file normalize "${origin_dir}/rtl/top.v" ]\
 ]
 set added_files [add_files -fileset sources_1 $files]
 
@@ -184,9 +195,9 @@ if {[string equal [get_filesets -quiet constrs_1] ""]} {
 set obj [get_filesets constrs_1]
 
 # Add/Import constrs file and set constrs file properties
-set file "[file normalize "$origin_dir/coprocessor.srcs/constrs_1/new/pins.xdc"]"
+set file "[file normalize "$origin_dir/constrs/pins.xdc"]"
 set file_added [add_files -norecurse -fileset $obj [list $file]]
-set file "new/pins.xdc"
+set file "pins.xdc"
 set file_obj [get_files -of_objects [get_filesets constrs_1] [list "*$file"]]
 set_property -name "file_type" -value "XDC" -objects $file_obj
 
@@ -201,12 +212,15 @@ if {[string equal [get_filesets -quiet sim_1] ""]} {
 
 # Set 'sim_1' fileset object
 set obj [get_filesets sim_1]
-# Empty (no sources present)
+# Add simulation testbench (2026-10-15: 无头仿真流程见 sim/run_sim.ps1)
+set files [list \
+ [file normalize "${origin_dir}/sim/tb_top.v" ]\
+]
+set added_files [add_files -fileset sim_1 $files]
 
 # Set 'sim_1' fileset properties
 set obj [get_filesets sim_1]
-set_property -name "sim_wrapper_top" -value "1" -objects $obj
-set_property -name "top" -value "top" -objects $obj
+set_property -name "top" -value "tb_top" -objects $obj
 set_property -name "top_lib" -value "xil_defaultlib" -objects $obj
 
 # Set 'utils_1' fileset object
