@@ -28,6 +28,13 @@
  */
 #include "../../main/fall_core.c"
 
+/*
+ * SD 记录的 CSV 格式同样直接编入（2026-10-17 新增）。
+ * 目的：逐字节锁定 docs/团队协作规范与接口契约.md §2.1 的表头与行格式，
+ * 防止"文档一套、固件一套"的接口漂移 —— 与 fall_core 同一纪律。
+ */
+#include "../../main/log_fmt.c"
+
 /* --------------------------------------------------------------------------
  * 期望迁移序列比对
  * -------------------------------------------------------------------------- */
@@ -368,6 +375,111 @@ int main(int argc, char **argv)
         ran++;
         printf("\n");
     }
+    /*
+     * ======================================================================
+     * 以下为 2026-10-17 新增：SD 卡 CSV 格式契约测试（契约 §2.1）
+     *   这两个模块不含硬件即可验证的部分就是"写出的 CSV 长什么样"，
+     *   因此把它提升为断言，锁死表头与行格式。
+     * ======================================================================
+     */
+
+    /* 场景 9：表头必须与契约 §2.1 逐字节一致 */
+    {
+        const char *expect =
+            "Timestamp_ms,Seq,AccX,AccY,AccZ,GyroX,GyroY,GyroZ,"
+            "CSI_Variance,State\n";
+        const char *actual = log_fmt_header();
+        int ok = (strcmp(actual, expect) == 0);
+
+        printf("[9] csv header (contract §2.1)\n");
+        printf("  actual  : %s", actual);
+        if (!ok) {
+            printf("  expect  : %s", expect);
+            printf("  ASSERT FAILED: header differs from contract §2.1\n");
+            failures++;
+        } else {
+            printf("  [PASS] header matches contract §2.1 byte for byte\n");
+        }
+        ran++;
+        printf("\n");
+    }
+
+    /* 场景 10：一行数据格式与字段数（10 个字段 = 9 个逗号） */
+    {
+        int16_t acc[3]  = { 2048, -2048, 32767 };
+        int16_t gyro[3] = { -32768, 0, 16 };
+        char    buf[LOG_FMT_LINE_MAX];
+        const char *expect = "123456,42,2048,-2048,32767,-32768,0,16,0,3\n";
+        int n = log_fmt_row(buf, sizeof(buf), 123456u, 42u,
+                            acc, gyro, 0u, 3u);
+        int commas = 0;
+        int i;
+        int ok;
+
+        for (i = 0; buf[i] != '\0'; i++) {
+            if (buf[i] == ',') {
+                commas++;
+            }
+        }
+        ok = (n > 0) && ((size_t)n < sizeof(buf)) &&
+             (strcmp(buf, expect) == 0) && (commas == 9);
+
+        printf("[10] csv row formatting\n");
+        printf("  actual  : %s", buf);
+        if (!ok) {
+            printf("  expect  : %s", expect);
+            printf("  ASSERT FAILED: n=%d commas=%d (expect len=%d commas=9)\n",
+                   n, commas, (int)strlen(expect));
+            failures++;
+        } else {
+            printf("  [PASS] row matches contract, %d fields\n", commas + 1);
+        }
+        ran++;
+        printf("\n");
+    }
+
+    /* 场景 11：极值不溢出缓冲区，且缓冲区过小必须能被检测出来 */
+    {
+        int16_t acc[3]  = { -32768, -32768, -32768 };
+        int16_t gyro[3] = { -32768, -32768, -32768 };
+        char    big[LOG_FMT_LINE_MAX];
+        char    small[16] = { 0 };
+        const char *expect =
+            "4294967295,65535,-32768,-32768,-32768,-32768,-32768,-32768,"
+            "4294967295,255\n";
+        int n_big   = log_fmt_row(big, sizeof(big), 4294967295u, 65535u,
+                                  acc, gyro, 4294967295u, 255u);
+        int n_small = log_fmt_row(small, sizeof(small), 4294967295u, 65535u,
+                                  acc, gyro, 4294967295u, 255u);
+        int ok = 1;
+
+        printf("[11] csv row extremes + truncation detection\n");
+        printf("  actual  : %s", big);
+        if (n_big <= 0 || (size_t)n_big >= sizeof(big)) {
+            printf("  ASSERT FAILED: extreme row overflowed LOG_FMT_LINE_MAX\n");
+            ok = 0;
+        }
+        if (strcmp(big, expect) != 0) {
+            printf("  expect  : %s", expect);
+            printf("  ASSERT FAILED: extreme row mismatch\n");
+            ok = 0;
+        }
+        if (n_small < (int)sizeof(small)) {
+            printf("  ASSERT FAILED: truncation not reported "
+                   "(n=%d, size=%d)\n", n_small, (int)sizeof(small));
+            ok = 0;
+        }
+        if (ok) {
+            printf("  [PASS] extremes ok (len=%d), truncation reported "
+                   "(n=%d >= %d)\n",
+                   n_big, n_small, (int)sizeof(small));
+        } else {
+            failures++;
+        }
+        ran++;
+        printf("\n");
+    }
+
     printf("=========================================\n");
     if (failures == 0) {
         printf(" OFFLINE TEST: ALL %d SCENARIOS PASSED\n", ran);

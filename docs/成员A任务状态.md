@@ -2,6 +2,98 @@
 
 ---
 
+## 2026-10-17 新增：OLED 状态显示 + microSD 数据记录
+
+1.3" 四脚 I2C OLED 与六脚 microSD 模块到货，已接入基站固件。
+**代码：编译 + 离线验证通过；上板：OLED 上线、四幕联调通过，SD 记录未通过**（见下方真机记录）。
+
+| 项 | 内容 |
+|---|---|
+| 新增源文件 | `main/board_pins.h`（引脚与开关集中点）、`main/oled_display.c/.h`、`main/sd_log.c/.h`、`main/log_fmt.c/.h` |
+| OLED | I2C0（SDA=GPIO4 / SCL=GPIO5），128x64，6x8 点阵 ASCII，8 行状态屏；地址自动探测 0x3C/0x3D；**SSD1306 与 SH1106 通吃**（页寻址），型号用 `OLED_CTRL_SH1106` 宏切换 |
+| microSD | SPI2（CS=GPIO10 / SCK=GPIO12 / MOSI=GPIO11 / MISO=GPIO13），FATFS，文件名 `DATA_001.CSV` 起按卡上已有编号递增 |
+| CSV 格式 | 严格契约 §2.1，表头与行格式集中在 `log_fmt.c`，被离线自测逐字节断言 |
+| 实时性 | 写卡走**独立任务 + 环形缓冲（256 项）**：收包任务只做非阻塞入队，绝不因写卡打断 100ms 收包/判定节拍 |
+| 容错 | SD 挂载失败 / OLED 无应答 / 写卡中途失败 —— 一律只禁用该功能，**绝不影响跌倒判定与报警主链路**（真机已确认） |
+| 验收证据 | `idf.py fullclean` 后全量重编 **0 error / 编译告警 0**（1085/1085 步，退出码 0）；离线自测 **11/11 全过**（原 8 场景无回归 + 新增 3 个 CSV 契约场景） |
+| 体积 | `base_station.bin` = 928,320 B (0xE2A40)，按工程配置的 1M app 分区余量 120,256 B (11%)；**实板 flash 为 16MB（见下），余量其实很宽裕** |
+| 引脚对应表 | [hardware/schematics/基站接线表.md](../hardware/schematics/基站接线表.md)（接线/电平/引脚避让，不含上机步骤） |
+
+### 真机验证记录（2026-10-18，COM4）
+
+串口为板上 `USB-Enhanced-SERIAL CH343` 桥（COM4）。
+
+**① 板卡事实：flash 实际 16MB**
+
+启动日志：`spi_flash: Detected size(16384k) larger than the size in the binary image header(2048k)`。
+工程按 2MB 配置、实际芯片 16MB —— 当前够用，**将来要扩 app 分区/加文件系统时有 8 倍余量**，
+不必再迁就 1M 分区。
+
+**② OLED：I2C 与初始化通过**
+
+`OLED: panel ready: addr=0x3C ctrl=SSD1306 size=128x64`
+
+- 地址探测命中 **0x3C**；初始化序列走完 → **模块是 SSD1306，`OLED_CTRL_SH1106` 保持默认 0 正确**；
+- GPIO4/5 接线确认可用；
+- ⚠️ 屏幕**显示内容**尚未人工目视确认（无摄像头）——本次唯一未覆盖的验收项。
+
+**③ 主链路四幕联调：通过，且与离线自测/上轮实测逐位一致**
+
+用 `tools/offline_test/send_stream.py` 的同一批合成帧（离线测过的帧 = 上板发的帧）连续推流：
+
+| 环节 | 真机日志 | 参照值 |
+|---|---|---|
+| 收包质量 | `STATS packets=637 frames_ok=637 frames_bad=0` | 全部解出，0 坏帧 |
+| 走动 | `STATE IDLE -> WALK`（gyro2=1221414） | 一致 |
+| 冲击 | `STATE WALK -> PENDING seq=25 mag2=90425590` | **与上轮实测值相同** |
+| 确认 | `STATE PENDING -> CONFIRMED seq=99`，距冲击 **1517ms** | seq=99 / 1511ms |
+| 报警下行 | `TX cmd=0x01 [AA 55 01 00 00 00 01 0D]` | **逐字节一致** |
+| 抓拍指令 | `snap cmd sent to 192.168.4.2:8889` | 契约 §1.3 |
+| 解除 | `STATE CONFIRMED -> IDLE` + `TX cmd=0x02 [AA 55 02 00 00 00 02 0D]` | **逐字节一致** |
+| 状态同步 | `TX cmd=0x10 p1=0x01 / 0x02` | 契约 §4.3 |
+
+→ **结论：新增两个模块没有让已验证的主链路回归。** 冲击阈值、确认帧号、时间窗、
+下行帧字节这些决定安全性的值全部吻合。
+
+**④ SD 记录：未通过，原因未定案**
+
+| 情况 | 日志签名 | 含义 |
+|---|---|---|
+| 卡在位 | `cmd=52/5` 有 R1 响应 → `failed to mount card (13)` | FatFs `FR_NO_FILESYSTEM` —— **卡识别与 SPI 通信正常** |
+| 卡取出 | `sdmmc_card_init failed (0x107)` | `ESP_ERR_TIMEOUT` —— 与"卡在位"签名完全不同 |
+
+- "卡识别正常"是源码级判据：IDF 的 `vfs_fat_sdmmc.c` 中 `sdmmc_card_init` 在 `f_mount` **之前**，
+  而日志只有 `failed to mount card`、没有 `sdmmc_card_init failed`；
+- **已排除 SPI 时钟**：`SD_MAX_FREQ_KHZ` 由 20000 降到 10000 重烧，报错一字不变；
+- 已知硬约束：IDF v6.1 的 FatFs **`FF_FS_EXFAT` 写死为 0**（无对应 Kconfig），**不支持 exFAT**；
+- 待定案：卡主确认该卡为 FAT32，故需 **dump 扇区 0** 看是否为 GPT 分区表 / 引导扇区异常。
+  **卡目前被取出（卡上有数据待归档），复测放到下一轮**。
+
+**⑤ 降级设计：真机确认有效**
+
+SD 挂载失败时只输出 `SDLOG: mount /sdcard failed` +
+`BASE: sd log init failed, data recording disabled`，随后 SoftAP / UDP 收包 / 跌倒判定 /
+OLED / FPGA 下行**全部照常工作** —— 与设计预期一致。
+
+**⑥ 本次未覆盖**
+
+- **FPGA 未接**：声光致动未验（只验到"FPGA 会收到什么帧"，字节级）；
+- **SD 记录未验**（挂载未通过）；
+- **OLED 屏内容未目视**。
+
+### 上板后更新的事实
+
+（"上板不符改参数"类备注；以下几条已由真机确认，不再是待确认项）
+
+- **OLED 控制器 = SSD1306**（探测 + 初始化确认）→ `OLED_CTRL_SH1106` **保持 0**，
+  原"若错位 2 列则是 SH1106"的备用开关未被触发；
+- **GPIO4 / 5 已确认可用**（OLED 通信成功）；
+- **GPIO10~13 已确认可用**（SD 卡识别成功、SPI 通信正常）→ **SD 挂载失败与接线/引脚无关**；
+- 仍待确认：**六脚 SD 模块的供电丝印**。卡识别只需小电流，写卡大电流下才可能暴露供电不足，
+  故这一条保留（标 `3.3V` 的只能供 3V3，标 `5V` 的按模块说明供电；信号侧始终 3.3V）。
+
+---
+
 ## 架构变更（2026-10-14）
 
 **STM32 协处理器已撤除，基站由三块板改为两块板（ESP32-S3 + Artix-7 FPGA）。**
@@ -61,7 +153,11 @@
 | 姿态帧解析 + 跌倒判定 | `main/fall_core.c/.h` | 纯 C99 核心，阈值集中在头文件顶部 |
 | CSI 占位 | `main/csi_stub.c/.h` | 接口已留好，`csi_ready()` 恒 false |
 | FPGA 链路 | `main/fpga_link.c/.h` | UART1 GPIO17，115200，协议见契约 §4 |
-| 主程序 | `main/base_station.c` | SoftAP/收包/判定/下发/日志 |
+| 引脚与功能开关 | `main/board_pins.h` | OLED/SD 引脚 + `ENABLE_*` 开关集中点，改线只改这里 |
+| OLED 显示 | `main/oled_display.c/.h` | I2C 驱动（SSD1306/SH1106 通吃）+ 8 行状态屏 |
+| SD 记录 | `main/sd_log.c/.h` | SPI2+FATFS 挂载、文件编号递增、环形缓冲 + 记录任务 |
+| CSV 格式 | `main/log_fmt.c/.h` | 纯 C99，契约 §2.1 表头与行格式（宿主机离线可测） |
+| 主程序 | `main/base_station.c` | SoftAP/收包/判定/下发/日志 + OLED 状态快照任务 |
 | FPGA 侧 | `coprocessor/rtl/*.v` | uart_rx / cmd_decoder / seg_display / buzzer_ctrl / top；上电自检 2s（契约 §4.7） |
 
 ### FPGA 工程布局
@@ -86,6 +182,7 @@ RTL/约束放在 `rtl/`、`constrs/`，不放 Vivado 生成的 `coprocessor.srcs
 
 ## 本期明确不做（原因与决策见 CHANGELOG）
 
-- MicroSD 数据记录、OLED 状态显示（模块未到货）
-- 真实 CSI 提取（需穿戴端在场，`csi_stub` 占位留接口）
+- 真实 CSI 提取（需穿戴端在场，`csi_stub` 占位留接口；CSV 的 `CSI_Variance` 列当前恒 0）
 - 穿戴端联调（需成员 B 在场；抓拍指令照发，目标不在只打日志）
+- OLED 中文显示（6x8 字库只覆盖 ASCII，中文字库体积与本期收益不成比例）
+- SD 运行中热插拔重挂载（六脚模块无卡检测脚，拔卡即停止记录，重新上电恢复）
