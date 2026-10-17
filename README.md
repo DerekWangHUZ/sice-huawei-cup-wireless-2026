@@ -19,8 +19,9 @@
 ```text
 .
 ├── firmware/                   # 嵌入式固件工程源码
-│   ├── base_station/           # [成员 A] ESP32-S3 核心主控工程 (SoftAP / CSI提取 / SD / OLED)
-│   │   ├── main/               #    固件源码（fall_core 判定核心 / fpga_link / csi_stub）
+│   ├── base_station/           # [成员 A] ESP32-S3 核心主控工程 (SoftAP / CSI / SD / OLED)
+│   │   ├── main/               #    固件源码（fall_core 判定核心 / fpga_link / csi_stub
+│   │   │                       #              / oled_display / sd_log / log_fmt / board_pins）
 │   │   └── tools/offline_test/ #    离线自测与上板发假包工具（无板可跑）
 │   ├── wearable/               # [成员 B] ESP32-CAM 穿戴标签工程 (MPU6050 / UDP推流 / 抓拍)
 │   └── coprocessor/            # [成员 A] Artix-7 FPGA 协处理器工程
@@ -32,7 +33,7 @@
 │   └── (离线分析脚本与特征提取逻辑)
 │
 ├── hardware/                   # 硬件工程资料
-│   ├── schematics/             # 电气原理图、引脚对应表
+│   ├── schematics/             # 电气原理图、引脚对应表（基站接线表.md）
 │   └── photos/                 # 硬件实物定妆照与佩戴效果图
 │
 ├── docs/                       # 项目协作规范与参赛文档
@@ -69,6 +70,21 @@
 | `Byte 4~15`| 六轴数据 | `int16_t[6]` | AccX, AccY, AccZ, GyroX, GyroY, GyroZ (小端序) |
 | `Byte 16`  | 校验和 | `uint8_t` | Byte 2~15 异或校验 (XOR) |
 | `Byte 17`  | 帧尾 | `uint8_t` | 固定 `0x0D` |
+
+### 3. 基站本地外设（OLED / microSD）
+
+| 外设 | 接口 | 引脚（ESP32-S3） | 用途 |
+|---|---|---|---|
+| OLED 1.3" 128x64 | I2C0 | SDA=GPIO4 / SCL=GPIO5 | 基站状态屏：AP/IP、判定状态、包与帧计数、SD 文件名、告警与 FPGA 链路 |
+| microSD 模块 | SPI2 | CS=GPIO10 / SCK=GPIO12 / MOSI=GPIO11 / MISO=GPIO13 | 按契约 §2.1 记录姿态 CSV（`/DATA_001.CSV` 起按卡上已有编号递增） |
+
+全量接线、电平要求与引脚避让清单见
+[基站接线表.md](hardware/schematics/基站接线表.md)。
+**现场改线只需修改 `firmware/base_station/main/board_pins.h`**（引脚与功能开关集中点）。
+CSV 表头与行格式集中在 `firmware/base_station/main/log_fmt.c`，并由宿主机离线自测逐字节断言。
+
+> 烧录、连热点、发假包、每步现象与排障等**上机操作内容按仓库规范不入库**，
+> 位于开发者本机手册《上机操作说明-跌倒报警联调.md》。
 
 ---
 
