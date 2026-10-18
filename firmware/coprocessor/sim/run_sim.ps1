@@ -60,6 +60,7 @@ $Sources = @(
     (Join-Path $SrcDir 'cmd_decoder.v'),
     (Join-Path $SrcDir 'seg_display.v'),
     (Join-Path $SrcDir 'buzzer_ctrl.v'),
+    (Join-Path $SrcDir 'led_ctrl.v'),
     (Join-Path $SrcDir 'top.v'),
     $TbFile
 )

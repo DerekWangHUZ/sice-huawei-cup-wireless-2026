@@ -223,4 +223,15 @@ const char *fall_state_name(fall_state_t s);
 uint32_t fall_acc_magnitude2(const int16_t acc[3]);   /* 单位 LSB² */
 uint32_t fall_gyro_magnitude2(const int16_t gyro[3]); /* 单位 LSB² */
 
+/*
+ * 合加速度幅值，单位 0.01g（即 1.00g -> 100），供 FPGA 数码管显示。
+ *
+ * 纯整数实现（逐位整数开方），不依赖 math.h —— fall_core.c 必须保持
+ * 纯 C99 并且被离线自测宿主程序直接 #include，所以这里不能用 sqrtf。
+ *
+ * 结果饱和到 9999（99.99g）：FPGA 侧数码管为 4 位 "XX.XX"，超出即无法表示，
+ * 与其溢出回绕不如钉在上限。协议见 docs/团队协作规范与接口契约.md §4.3。
+ */
+uint16_t fall_acc_mag_centi_g(const int16_t acc[3]);
+
 #endif /* FALL_CORE_H */

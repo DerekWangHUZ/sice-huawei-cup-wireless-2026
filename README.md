@@ -25,9 +25,11 @@
 │   │   └── tools/offline_test/ #    离线自测与上板发假包工具（无板可跑）
 │   ├── wearable/               # [成员 B] ESP32-CAM 穿戴标签工程 (MPU6050 / UDP推流 / 抓拍)
 │   └── coprocessor/            # [成员 A] Artix-7 FPGA 协处理器工程
-│       ├── rtl/                #    RTL 源码（uart_rx / cmd_decoder / seg_display / buzzer_ctrl / top）
+│       ├── rtl/                #    RTL 源码（uart_rx / cmd_decoder / seg_display / buzzer_ctrl / led_ctrl / top）
 │       ├── constrs/            #    引脚约束
-│       └── sim/                #    testbench + 无头仿真脚本（run_sim.ps1）
+│       ├── sim/                #    testbench + 无头仿真脚本（run_sim.ps1）
+│       ├── program_bit.tcl     #    JTAG 下载比特流（掉电即失，改完立刻看现象用）
+│       └── program_mcs.tcl     #    固化到板载配置 Flash（掉电不丢；本板上电后需按一次 CONFIG）
 │
 ├── algorithm/                  # [成员 C] 算法与数据处理
 │   └── (离线分析脚本与特征提取逻辑)
@@ -75,16 +77,13 @@
 
 | 外设 | 接口 | 引脚（ESP32-S3） | 用途 |
 |---|---|---|---|
-| OLED 1.3" 128x64 | I2C0 | SDA=GPIO4 / SCL=GPIO5 | 基站状态屏：AP/IP、判定状态、包与帧计数、SD 文件名、告警与 FPGA 链路 |
+| OLED 1.3" 128x64 | I2C0 | SDA=GPIO4 / SCL=GPIO5 | 基站状态屏（中文大字）：标题栏 + 32x32 状态「正常/行走/疑似跌倒/跌倒告警」（告警 2Hz 反色闪烁）+ `PKT/SEQ` 收包活性 + `SD/F/坏帧/丢弃` |
 | microSD 模块 | SPI2 | CS=GPIO10 / SCK=GPIO12 / MOSI=GPIO11 / MISO=GPIO13 | 按契约 §2.1 记录姿态 CSV（`/DATA_001.CSV` 起按卡上已有编号递增） |
 
 全量接线、电平要求与引脚避让清单见
 [基站接线表.md](hardware/schematics/基站接线表.md)。
 **现场改线只需修改 `firmware/base_station/main/board_pins.h`**（引脚与功能开关集中点）。
 CSV 表头与行格式集中在 `firmware/base_station/main/log_fmt.c`，并由宿主机离线自测逐字节断言。
-
-> 烧录、连热点、发假包、每步现象与排障等**上机操作内容按仓库规范不入库**，
-> 位于开发者本机手册《上机操作说明-跌倒报警联调.md》。
 
 ---
 

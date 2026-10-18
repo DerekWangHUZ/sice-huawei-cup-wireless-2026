@@ -26,7 +26,7 @@
 | 项 | 内容 |
 |---|---|
 | 新增源文件 | `main/board_pins.h`（引脚与开关集中点）、`main/oled_display.c/.h`、`main/sd_log.c/.h`、`main/log_fmt.c/.h` |
-| OLED | I2C0（SDA=GPIO4 / SCL=GPIO5），128x64，6x8 点阵 ASCII，8 行状态屏；地址自动探测 0x3C/0x3D；**SSD1306 与 SH1106 通吃**（页寻址），型号用 `OLED_CTRL_SH1106` 宏切换 |
+| OLED | I2C0（SDA=GPIO4 / SCL=GPIO5），128x64，**中文 16x16 + ASCII 6x8 点位图状态屏**（2026-10-18 升级为中文大字，见下节）；地址自动探测 0x3C/0x3D；**SSD1306 与 SH1106 通吃**（页寻址），型号用 `OLED_CTRL_SH1106` 宏切换 |
 | microSD | SPI2（CS=GPIO10 / SCK=GPIO12 / MOSI=GPIO11 / MISO=GPIO13），FATFS，文件名 `DATA_001.CSV` 起按卡上已有编号递增 |
 | CSV 格式 | 严格契约 §2.1，表头与行格式集中在 `log_fmt.c`，被离线自测逐字节断言 |
 | 实时性 | 写卡走**独立任务 + 环形缓冲（256 项）**：收包任务只做非阻塞入队，绝不因写卡打断 100ms 收包/判定节拍 |
@@ -126,7 +126,7 @@ OLED / FPGA 下行**全部照常工作** —— 与设计预期一致。
 | 板 | 工程路径 | 完成内容 | 验收证据 | 状态 |
 |---|---|---|---|---|
 | ESP32-S3（基站） | `firmware/base_station` | SoftAP（CSI_FALL_AP/信道6）+ UDP 8888 收包 + 18B 帧解析 + 跌倒判定状态机 + UART 下发报警命令 + 抓拍指令 | `idf.py build` 全量重编 0 error（`Project build complete`） | ✅ 完成 |
-| Artix-7（协处理器） | `firmware/coprocessor` | UART 命令接收 + 帧解码（滑动重同步）+ 6 位数码管显示 + 蜂鸣器告警 + LED 映射 + 上电自检（单板可验） | 无头仿真 9 场景全过（`ALL CHECKS PASSED`）；综合/实现/比特流无头完成（`top.bit`，0 error） | ✅ 完成 |
+| Artix-7（协处理器） | `firmware/coprocessor` | UART 命令接收 + 帧解码（滑动重同步）+ 6 位数码管显示（状态助记符 + 实时合加速度读数）+ 蜂鸣器载波节拍告警 + LED 效果引擎（`led_ctrl.v`）+ 上电自检（单板可验）+ 可固化到板载配置 Flash | 无头仿真 9 场景全过（`ALL CHECKS PASSED`）；综合/实现/比特流无头完成（`top.bit`，0 error，`All user specified timing constraints are met`）；`top.mcs` 已生成 | ✅ 完成 |
 
 ### 离线自测（改判定逻辑后必跑）
 
@@ -192,8 +192,45 @@ RTL/约束放在 `rtl/`、`constrs/`，不放 Vivado 生成的 `coprocessor.srcs
 - 数码管按 6 位实现（位选 `an[0..5]`）；段码极性/位选极性做成模块参数
   （`seg_display.v` 的 `SEG_INVERT`/`AN_ACTIVE_LOW`），上板不符改参数即可。
 - 板间协议权威定义见 [团队协作规范与接口契约.md](团队协作规范与接口契约.md) §四。
-- **上机操作文档不在仓库**，位于本机下载文件夹《上机操作说明-跌倒报警联调.md》
-  （烧录/接线/连热点/发假包/每步现象/排障，仓库结构里不放实操手册）。
+- **上机操作文档按仓库规范不入库**（烧录/接线/连热点/发假包/每步现象/排障），
+  由开发者自行保管，仓库内不引用。
+
+---
+
+## 2026-10-18 增强：FPGA 声光效果 + OLED 中文状态屏
+
+决策依据与完整验证见 [CHANGELOG](CHANGELOG.md) 同日「声光效果增强」条目。
+**协议 §4 帧格式/命令码/状态码零改动**，S3 侧 `fpga_link` 无需重编即可配套。
+
+| 项 | 内容 |
+|---|---|
+| 蜂鸣器 | `rtl/buzzer_ctrl.v` 改「约 2.7kHz 载波 × 三短一停节拍」（响150/停100/响150/停100/响150/静600 ms），新增 `beat` 包络输出。**音量提升来自载波**：实板若为有源蜂鸣器且叠加后音色变差，`TONE_ENABLE=0` 一处回退 |
+| 数码管 | `rtl/seg_display.v` 分档显示：静止/走动 = `S`+状态码右对齐 + 小数点 1Hz 心跳；待确认 = 数字位 4Hz 快闪；告警 = `FALL--` 约 3.3Hz 急闪 + 6 位小数点 30ms/步流水 |
+| LED | 新增 `rtl/led_ctrl.v`（16 路 8 位软 PWM）：告警随蜂鸣节拍爆闪 / 静止 `led[0]` 呼吸灯 / 走动环形流水 / 待确认 KITT 扫描；`top.v` 由内联映射改为实例化该模块 |
+| OLED | 新增 `main/font_cjk16.h`（14 字 16x16，约 0.5KB）+ UTF-8 混排、2 倍放大、反色/实底三组绘制原语；屏面 = 反色标题栏「跌倒检测基站」+ 32x32 大号中文状态（告警 2Hz 反色闪烁）+ `PKT/SEQ` + `SD/F/坏帧/丢弃` |
+| 字模工具 | `tools/font_gen/gen_cjk16.ps1`（本机宋体渲染 + 墨水居中 + 输出 ASCII 点阵图供目视校验；脚本纯 ASCII，规避 PowerShell 5.1 按 ANSI 解析中文注释的问题） |
+| 验收证据 | FPGA 仿真 `SIM RESULT: PASS`（9 场景全过，负测试零回归）；Vivado `BITSTREAM_OK`、DRC 0 Errors、`All user specified timing constraints are met`、627 LUT(3.01%)/509 FF(1.22%)；固件 `fullclean` 全量重编 **0 error / 0 编译告警**，`base_station.bin` = 929,888 B（1M 分区余 11%）；离线自测 **14/14** |
+| 未覆盖 | **本次未上板**：① 蜂鸣器响度/音色试听；② OLED 中文目视（含上下半页是否颠倒） |
+
+---
+
+## 2026-10-18 第二次变更：掉电固化 + 数码管改为实时遥测读数
+
+决策依据与完整验证见 [CHANGELOG](CHANGELOG.md) 同日第二条条目。
+**协议 §4.3 / §4.5 / §4.8 已修订**（复用 `SET_STATE` 的 `p2` 保留位传递遥测），
+S3 侧 `fpga_link` / `base_station` 需重编重烧才能看到新读数。
+
+| 项 | 内容 |
+|---|---|
+| 掉电固化 | 新增 `program_mcs.tcl`：无头把 `top.mcs` 烧进板载配置 Flash（`n25q32-3.3v-spi-x1_x2_x4`，带器件型号护栏），内置 SPI 桥接位流自动定位与加载。此前只有 `program_bit.tcl` 走 JTAG 写 SRAM，**断电即失**。**烧写本身已验证成功**（`Erase`/`Program`/`Verify` 全过、读回逐字节一致） |
+| 数码管 | `rtl/seg_display.v` 重写为「2 位状态助记符 + 4 位实时合加速度读数」：`St`/`Go`/`Pd`/`AL` + `XX.XX`（单位 g，`an[2]` 的 dp 作小数点）。6 位全部承载信息，取消原 `S0`/`FALL--` 这类半屏空白；原小数点流水动画取消（dp 已有小数点语义） |
+| 遥测通路 | `cmd_decoder.v` 在 `SET_STATE` 时锁存 `p2` → `mag_x100`/`mag_valid`/`mag_update`；`0xFFFF` 为"暂无遥测"哨兵 → 读数位显示 `----`（不伪装成 `00.00`）；`base_station.c` 以 1Hz 周期发遥测刷新帧，CONFIRMED 期间停发（读数定格为冲击幅值） |
+| 读数老化 | **FPGA 侧 3s 老化看门狗**（`seg_display.v` 的 `TELEM_STALE_DIV`）：超时自动切 `----`，不依赖 S3 是否继续发哨兵。**告警期间冻结**（`alarm_on=1` 停摆计时器），读数定格为冲击幅值直到告警解除。之所以放 FPGA 侧，是因为实测发现 S3 的 `SO_RCVTIMEO` 在本 IDF 构建下不生效、无数据时收包任务阻塞在 `recvfrom`（既有缺陷，见下行） |
+| 换算函数 | `fall_core.c` 新增 `fall_acc_mag_centi_g()`：纯整数逐位开方（不引入 `math.h`，保持纯 C99 以便离线自测直接 `#include`），输出 0.01g 单位 |
+| 验收证据 | FPGA 仿真 `SIM RESULT: PASS`（含新增遥测读数、老化看门狗、助记符、哨兵断言）；Vivado `BITSTREAM_OK`、DRC 0 Errors、`All user specified timing constraints are met`；`top.mcs` 6,165,628 B 已生成；固件全量重编 **0 error / 0 编译告警**；离线自测 **15/15**（新增场景 15 遥测换算逐点锁定） |
+| ⚠️ **未解决**：上电不自动启动 | 烧写成功、读回一致，但**断电再上电不会自动启动**（`DONE`=0，全无反应），**按一次板上 CONFIG 按钮即正常**。该现象即证明 Flash 内容、MSEL、烧写方式、mcs 格式均无问题，唯一失效的是"上电瞬间的自动触发"，指向板级上电复位电路。**该板在本次改动前无需按 CONFIG，上电即自动启动；本次未触及配置电路相关约束，但无法定位致因，按现状无法修复。** 详见 `docs/FPGA实验板资料参考.md` §9b |
+| 本轮发现的既有缺陷（非本次改动引入，待单独修） | **S3 收包 socket 的 100ms `SO_RCVTIMEO` 实测不生效**：连续 25s 无数据时 `STATS` 一次都不打印（PowerShell 直读串口 + `idf.py monitor` 两种方式均如此），日志停在 `main_task: Returned from app_main()`；有帧到达时 `STATS` 正常。与历史记录"33s 无数据、**收到下一帧时**才判掉线"吻合。曾改用 `select()` 显式超时重编重烧，实机表现相同，因无法取得可验证改善而**回退**。影响面：空闲路径的 `fall_detector_tick`（告警超时解除/掉线保护）与遥测哨兵；**不影响收包主链路**，也不影响数码管读数真实性（已由 FPGA 侧 3s 老化兜住） |
+| 未覆盖（需上机） | ① S3 重烧后数码管读数目视；② 蜂鸣器音色试听 |
 
 ---
 
@@ -201,5 +238,4 @@ RTL/约束放在 `rtl/`、`constrs/`，不放 Vivado 生成的 `coprocessor.srcs
 
 - 真实 CSI 提取（需穿戴端在场，`csi_stub` 占位留接口；CSV 的 `CSI_Variance` 列当前恒 0）
 - 穿戴端联调（需成员 B 在场；抓拍指令照发，目标不在只打日志）
-- OLED 中文显示（6x8 字库只覆盖 ASCII，中文字库体积与本期收益不成比例）
 - SD 运行中热插拔重挂载（六脚模块无卡检测脚，拔卡即停止记录，重新上电恢复）

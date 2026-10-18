@@ -1,11 +1,17 @@
 /*
  * oled_display.c -- 1.3" 四脚 I2C OLED 驱动实现（SSD1306 / SH1106 通吃）
  *
- * 详见 oled_display.h 的设计说明。
+ * 详见 oled_display.h 的设计说明与屏面布局。
+ *
+ * 点阵数据格式：
+ *   帧缓存 s_fb[page][col] 与 SSD1306 显存一一对应：一页 8 行 x 128 列，
+ *   列内 bit0 在最上方。故 16x16 汉字 = 同列相邻两页各 16 字节，直接位运算
+ *   写入，不需要任何转置（见 font_cjk16.h 的格式说明）。
  */
 
 #include "oled_display.h"
 #include "board_pins.h"
+#include "font_cjk16.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -28,6 +34,9 @@ static const char *TAG = "OLED";
 /* 6x8 单元格：5 列字模 + 1 列间隔 -> 128/6 = 21 字符/行 */
 #define FONT_W        5
 #define FONT_CELL     6
+
+/* 状态大字占 4 页（32 行），起始页固定为 2（标题栏占 0~1） */
+#define OLED_BIG_PAGE 2u
 
 /* ==========================================================================
  * 6x8 ASCII 字库（0x20~0x7E，共 95 字）
@@ -131,6 +140,14 @@ static const uint8_t s_font5x7[95][FONT_W] = {
     { 0x08, 0x04, 0x08, 0x10, 0x08 }, /* '~' */
 };
 
+/* 未收录汉字的占位：16x16 空心方框 */
+static const uint8_t s_cjk_missing[CJK16_BYTES] = {
+    0xFF, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0xFF,
+    0xFF, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+    0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0xFF,
+};
+
 /* ==========================================================================
  * 内部状态
  * ========================================================================== */
@@ -144,6 +161,9 @@ static uint8_t s_fb[OLED_PAGES][OLED_WIDTH];
 static uint8_t s_shadow[OLED_PAGES][OLED_WIDTH];
 
 static uint32_t s_err_count = 0;
+
+/* 告警闪烁相位：每次刷新翻转一次（250ms 刷新 -> 2Hz 反色闪烁） */
+static bool s_blink = false;
 
 /* ==========================================================================
  * 底层 I2C 收发
@@ -333,9 +353,9 @@ esp_err_t oled_init(void)
     oled_clear();
     err = oled_flush();
 
-    ESP_LOGI(TAG, "panel ready: addr=0x%02X ctrl=%s size=%dx%d",
+    ESP_LOGI(TAG, "panel ready: addr=0x%02X ctrl=%s size=%dx%d cjk=%u",
              addr, OLED_CTRL_SH1106 ? "SH1106" : "SSD1306",
-             OLED_WIDTH, OLED_HEIGHT);
+             OLED_WIDTH, OLED_HEIGHT, (unsigned)CJK16_GLYPHS);
     return err;
 }
 
@@ -353,8 +373,134 @@ void oled_clear(void)
     memset(s_fb, 0, sizeof(s_fb));
 }
 
-/* 在页内按列绘制一个字符；超出右边界的列直接丢弃（截断） */
-static void draw_char(uint8_t page, uint8_t x, char ch)
+void oled_fill_page(uint8_t page, uint8_t value)
+{
+    if (page >= OLED_PAGES) {
+        return;
+    }
+    memset(s_fb[page], value, OLED_WIDTH);
+}
+
+/* UTF-8 解码：返回码点并推进指针；非法序列返回 0xFFFD 且至少前进 1 字节 */
+static uint32_t utf8_decode(const char **pp)
+{
+    const uint8_t *s = (const uint8_t *)*pp;
+    uint32_t       cp;
+    int            extra;
+    int            i;
+
+    if (s[0] < 0x80u) {
+        *pp += 1;
+        return (uint32_t)s[0];
+    } else if ((s[0] & 0xE0u) == 0xC0u) {
+        cp = (uint32_t)(s[0] & 0x1Fu);
+        extra = 1;
+    } else if ((s[0] & 0xF0u) == 0xE0u) {
+        cp = (uint32_t)(s[0] & 0x0Fu);
+        extra = 2;
+    } else if ((s[0] & 0xF8u) == 0xF0u) {
+        cp = (uint32_t)(s[0] & 0x07u);
+        extra = 3;
+    } else {
+        *pp += 1;
+        return 0xFFFDu;
+    }
+
+    for (i = 1; i <= extra; i++) {
+        if ((s[i] & 0xC0u) != 0x80u) {     /* 后续字节格式错：只前进 1 字节 */
+            *pp += 1;
+            return 0xFFFDu;
+        }
+        cp = (cp << 6) | (uint32_t)(s[i] & 0x3Fu);
+    }
+    *pp += (extra + 1);
+    return cp;
+}
+
+/* 查 16x16 字模；未收录返回 NULL */
+static const uint8_t *cjk16_lookup(uint32_t cp)
+{
+    size_t i;
+
+    for (i = 0; i < CJK16_GLYPHS; i++) {
+        if ((uint32_t)s_cjk16[i].cp == cp) {
+            return s_cjk16[i].bits;
+        }
+    }
+    return NULL;
+}
+
+/* 把 16x16 字模写入帧缓存（跨 page/page+1）。inv=true 时清位（反色） */
+static void blit16(uint8_t page, uint8_t x, const uint8_t *bits, bool inv)
+{
+    uint8_t h;
+    uint8_t c;
+
+    if (bits == NULL || (uint16_t)x + CJK16_W > OLED_WIDTH ||
+        (uint16_t)page + 1u >= OLED_PAGES) {
+        return;
+    }
+
+    for (h = 0; h < 2u; h++) {
+        uint8_t *dst = s_fb[page + h];
+        for (c = 0; c < CJK16_W; c++) {
+            uint8_t b = bits[(size_t)h * CJK16_W + c];
+            if (inv) {
+                dst[x + c] &= (uint8_t)~b;
+            } else {
+                dst[x + c] |= b;
+            }
+        }
+    }
+}
+
+/* 把 16x16 字模放大 2 倍（32x32，占 4 页）写入帧缓存 */
+static void blit16_2x(uint8_t page, uint8_t x, const uint8_t *bits, bool inv)
+{
+    uint8_t h;
+    uint8_t c;
+    uint8_t r;
+
+    if (bits == NULL || (uint16_t)x + 2u * CJK16_W > OLED_WIDTH ||
+        (uint16_t)page + 3u >= OLED_PAGES) {
+        return;
+    }
+
+    for (h = 0; h < 2u; h++) {                 /* 源上半页 / 下半页 */
+        for (c = 0; c < CJK16_W; c++) {
+            uint8_t src = bits[(size_t)h * CJK16_W + c];
+            uint8_t hi  = 0;                   /* 放大后该半页的上 8 行 */
+            uint8_t lo  = 0;                   /* 放大后该半页的下 8 行 */
+
+            for (r = 0; r < 4u; r++) {
+                if (src & (uint8_t)(1u << r)) {
+                    hi |= (uint8_t)(3u << (2u * r));
+                }
+            }
+            for (r = 4u; r < 8u; r++) {
+                if (src & (uint8_t)(1u << r)) {
+                    lo |= (uint8_t)(3u << (2u * (r - 4u)));
+                }
+            }
+
+            /* 横向同样放大 2 倍：相邻两列写同样的字节 */
+            for (r = 0; r < 2u; r++) {
+                uint8_t *d0 = &s_fb[page + h * 2u][x + c * 2u + r];
+                uint8_t *d1 = &s_fb[page + h * 2u + 1u][x + c * 2u + r];
+                if (inv) {
+                    *d0 &= (uint8_t)~hi;
+                    *d1 &= (uint8_t)~lo;
+                } else {
+                    *d0 |= hi;
+                    *d1 |= lo;
+                }
+            }
+        }
+    }
+}
+
+/* 在页内按列绘制一个 ASCII 字符；超出右边界的列直接丢弃（截断） */
+static void draw_char_ex(uint8_t page, uint8_t x, char ch, bool inv)
 {
     uint8_t       idx;
     const uint8_t *glyph;
@@ -371,9 +517,15 @@ static void draw_char(uint8_t page, uint8_t x, char ch)
     glyph = s_font5x7[idx];
 
     for (i = 0; i < FONT_W; i++) {
-        s_fb[page][x + i] = glyph[i];
+        if (inv) {
+            s_fb[page][x + i] &= (uint8_t)~glyph[i];
+        } else {
+            s_fb[page][x + i] |= glyph[i];
+        }
     }
-    s_fb[page][x + FONT_W] = 0x00;    /* 字符间隔列 */
+    if (!inv) {
+        s_fb[page][x + FONT_W] = 0x00;    /* 字符间隔列（顺色时清掉） */
+    }
 }
 
 void oled_draw_row(uint8_t page, const char *text)
@@ -384,9 +536,98 @@ void oled_draw_row(uint8_t page, const char *text)
         return;
     }
     while (*text != '\0' && (uint8_t)(x + FONT_CELL) <= OLED_WIDTH) {
-        draw_char(page, x, *text);
+        draw_char_ex(page, x, *text, false);
         x = (uint8_t)(x + FONT_CELL);
         text++;
+    }
+}
+
+/* 混排文本的公共实现 */
+static void draw_text_ex(uint8_t page, uint8_t x, const char *utf8, bool inv)
+{
+    if (utf8 == NULL || page >= OLED_PAGES) {
+        return;
+    }
+
+    while (*utf8 != '\0') {
+        uint32_t cp = utf8_decode(&utf8);
+        if (cp == 0u || cp == 0xFFFDu) {
+            continue;                       /* 非法字节已前进，直接跳过 */
+        }
+
+        if (cp < 0x80u) {                   /* ASCII：6x8 单元格 */
+            if ((uint16_t)x + FONT_CELL > OLED_WIDTH) {
+                break;
+            }
+            draw_char_ex(page, x, (char)cp, inv);
+            x = (uint8_t)(x + FONT_CELL);
+        } else {                            /* 汉字：16x16，跨两页 */
+            const uint8_t *bits = cjk16_lookup(cp);
+            if (bits == NULL) {
+                bits = s_cjk_missing;
+            }
+            if ((uint16_t)x + CJK16_W > OLED_WIDTH) {
+                break;
+            }
+            blit16(page, x, bits, inv);
+            x = (uint8_t)(x + CJK16_W);
+        }
+    }
+}
+
+void oled_draw_text(uint8_t page, uint8_t x, const char *utf8)
+{
+    draw_text_ex(page, x, utf8, false);
+}
+
+void oled_draw_text_inv(uint8_t page, uint8_t x, const char *utf8)
+{
+    draw_text_ex(page, x, utf8, true);
+}
+
+void oled_draw_big_text(uint8_t page, const char *utf8, bool inv)
+{
+    const char *p;
+    uint16_t    width = 0;
+    uint8_t     n = 0;
+    uint8_t     x;
+
+    if (utf8 == NULL) {
+        return;
+    }
+
+    /* 第一遍：量宽度（每字 32 列） */
+    p = utf8;
+    while (*p != '\0') {
+        uint32_t cp = utf8_decode(&p);
+        if (cp == 0u || cp == 0xFFFDu || cp < 0x80u) {
+            continue;
+        }
+        width = (uint16_t)(width + 2u * CJK16_W);
+        n++;
+    }
+    if (n == 0u) {
+        return;
+    }
+
+    x = (width >= OLED_WIDTH) ? 0u : (uint8_t)((OLED_WIDTH - width) / 2u);
+
+    /* 第二遍：绘制 */
+    p = utf8;
+    while (*p != '\0') {
+        uint32_t cp = utf8_decode(&p);
+        if (cp == 0u || cp == 0xFFFDu || cp < 0x80u) {
+            continue;
+        }
+        const uint8_t *bits = cjk16_lookup(cp);
+        if (bits == NULL) {
+            bits = s_cjk_missing;
+        }
+        if ((uint16_t)x + 2u * CJK16_W > OLED_WIDTH) {
+            break;
+        }
+        blit16_2x(page, x, bits, inv);
+        x = (uint8_t)(x + 2u * CJK16_W);
     }
 }
 
@@ -419,16 +660,29 @@ esp_err_t oled_flush(void)
 
 /* ==========================================================================
  * 状态屏渲染
+ *
+ * 遥测行图例：
+ *   PKT n SEQ m      收包总数 / 最近一帧序号（判断穿戴端是否在推流）
+ *   SD:xx F:xx a/b   SD 是否在记录 / FPGA 链路是否就绪 / 坏帧数 与 SD 丢弃数
  * ========================================================================== */
 
 esp_err_t oled_show_status(const oled_status_t *s)
 {
+    /* 大号状态词：索引 = fall_state_t（0 静止 / 1 走动 / 2 待确认 / 3 已确认） */
+    static const char *const STATE_TXT[4] = {
+        "正常", "行走", "疑似跌倒", "跌倒告警"
+    };
+
     /*
      * row 容量按"最长可能输出"给足（最长为 "PKT 4294967295 SEQ 65535" = 25），
      * 取 48 留裕量，避免 -Wformat-truncation 报错；
      * 实际每行只画 21 个字符，超出部分由 oled_draw_row 截断。
      */
-    char row[48];
+    char        row[48];
+    const char *big;
+    bool        blink_inv = false;
+    uint8_t     st;
+    uint8_t     title_x;
 
     if (s == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -436,29 +690,39 @@ esp_err_t oled_show_status(const oled_status_t *s)
 
     oled_clear();
 
-    oled_draw_row(0, "AP CSI_FALL_AP");
-    oled_draw_row(1, "IP 192.168.4.1");
+    /* --- y0~15：实底反色标题栏「跌倒检测基站」（6 字 x 16 列 = 96 列） --- */
+    oled_fill_page(0, 0xFF);
+    oled_fill_page(1, 0xFF);
+    title_x = (uint8_t)((OLED_WIDTH - 6u * CJK16_W) / 2u);
+    oled_draw_text_inv(0, title_x, "跌倒检测基站");
 
-    snprintf(row, sizeof(row), "STATE %s", fall_state_name(s->state));
-    oled_draw_row(2, row);
+    /* --- y16~47：32x32 大号状态；告警时整条反色闪烁（2Hz） --- */
+    if (s->alarm) {
+        s_blink   = !s_blink;          /* 每次刷新翻转 -> 250ms 刷新时为 2Hz */
+        blink_inv = s_blink;
+        big       = STATE_TXT[3];
+    } else {
+        st  = ((uint8_t)s->state < 4u) ? (uint8_t)s->state : 0u;
+        big = STATE_TXT[st];
+    }
+    if (blink_inv) {
+        /* 反色阶段：先把 4 页铺成实底，再清出笔画 -> 白底黑字 */
+        oled_fill_page(OLED_BIG_PAGE + 0u, 0xFF);
+        oled_fill_page(OLED_BIG_PAGE + 1u, 0xFF);
+        oled_fill_page(OLED_BIG_PAGE + 2u, 0xFF);
+        oled_fill_page(OLED_BIG_PAGE + 3u, 0xFF);
+    }
+    oled_draw_big_text(OLED_BIG_PAGE, big, blink_inv);
 
-    snprintf(row, sizeof(row), "PKT %u SEQ %u",
-             (unsigned)s->packets, (unsigned)s->last_seq);
-    oled_draw_row(3, row);
-
-    snprintf(row, sizeof(row), "OK %u BAD %u",
-             (unsigned)s->frames_ok, (unsigned)s->frames_bad);
-    oled_draw_row(4, row);
-
-    snprintf(row, sizeof(row), "SD %s", s->sd_ok ? s->sd_file : "FAIL");
-    oled_draw_row(5, row);
-
-    snprintf(row, sizeof(row), "DROP %u CSI %u",
-             (unsigned)s->sd_dropped, (unsigned)s->csi_var);
+    /* --- y48~55：收包活性 --- */
+    snprintf(row, sizeof(row), "PKT %lu SEQ %u",
+             (unsigned long)s->packets, (unsigned)s->last_seq);
     oled_draw_row(6, row);
 
-    snprintf(row, sizeof(row), "ALARM %s FPGA %s",
-             s->alarm ? "ON" : "OFF", s->fpga_ok ? "OK" : "--");
+    /* --- y56~63：存储 / 链路 / 质量计数 --- */
+    snprintf(row, sizeof(row), "SD:%s F:%s %lu/%lu",
+             s->sd_ok ? "OK" : "--", s->fpga_ok ? "OK" : "--",
+             (unsigned long)s->frames_bad, (unsigned long)s->sd_dropped);
     oled_draw_row(7, row);
 
     return oled_flush();

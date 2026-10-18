@@ -5,21 +5,24 @@
 // 功能描述 : 跌倒检测基站的 FPGA 协处理器顶层。
 //            接收 ESP32-S3 经 UART 下发的 8 字节控制帧（协议见
 //            docs/团队协作规范与接口契约.md §4），解码后驱动声光告警：
-//              - 6 位数码管显示状态 / 告警时闪烁 "FALL--"
-//              - 蜂鸣器告警时断续鸣响
-//              - 16 颗 LED 指示状态，告警时全亮
+//              - 6 位数码管：状态显示 "S+数字"（小数点心跳）/ 待确认数字
+//                快闪 / 告警时 "FALL--" 急闪 + 小数点流水
+//              - 蜂鸣器：音频载波 x 三短一停节拍（详见 buzzer_ctrl.v）
+//              - 16 颗 LED：呼吸灯 / 环形流水 / KITT 扫描 / 告警时与蜂鸣
+//                节拍同步的声光爆闪（详见 led_ctrl.v）
 //
 // 系统数据流 :
-//   rxd(F13) -> uart_rx -> cmd_decoder -> +--> seg_display -> seg/an -> 数码管
-//                                         +--> buzzer_ctrl  -> buzzer -> 蜂鸣器
-//                                         +--> LED 状态映射 -> led
+//   rxd -> uart_rx -> cmd_decoder -> +--> seg_display -> seg/an -> 数码管
+//                                   +--> buzzer_ctrl  -> buzzer -> 蜂鸣器
+//                                   |                \-> beat
+//                                   +--> led_ctrl <----/     -> led
 //
 // 上电自检（POST）:
 //   上电后前 POST_CYCLES 个时钟周期（默认 2s）强制走告警显示路径：
-//   数码管 FALL-- 闪烁、蜂鸣器断续鸣响、16 颗 LED 全亮；随后自动恢复
-//   正常待机。用途：不接 S3、单板上电即可验证数码管/蜂鸣器/LED 全链路
-//   （板间独立验证）。自检期间 UART 命令照常解码锁存，仅显示/蜂鸣输出
-//   被自检覆盖，自检结束后生效。
+//   数码管 FALL-- 急闪、蜂鸣器三短一停鸣响、16 颗 LED 随节拍爆闪；随后
+//   自动恢复正常待机。用途：不接 S3、单板上电即可验证数码管/蜂鸣器/LED
+//   全链路（板间独立验证）。自检期间 UART 命令照常解码锁存，仅显示/蜂鸣
+//   输出被自检覆盖，自检结束后生效。
 //
 // 接口说明 :
 //   clk        50MHz 主时钟（D4）
@@ -82,6 +85,9 @@ module top #(
     //------------------------------------------------------------------
     wire       alarm_on;
     wire [1:0] state_code;
+    wire [15:0] mag_x100;
+    wire       mag_valid;
+    wire       mag_update;
     wire       cmd_valid;
     wire       cmd_error;
 
@@ -92,6 +98,9 @@ module top #(
         .byte_data  (byte_data),
         .alarm_on   (alarm_on),
         .state_code (state_code),
+        .mag_x100   (mag_x100),
+        .mag_valid  (mag_valid),
+        .mag_update (mag_update),
         .cmd_valid  (cmd_valid),
         .cmd_error  (cmd_error)
     );
@@ -109,26 +118,40 @@ module top #(
         .rst_n      (rst_n),
         .state_code (state_code),
         .alarm_on   (disp_alarm),
+        .mag_x100   (mag_x100),
+        .mag_valid  (mag_valid),
+        .mag_update (mag_update),
         .seg        (seg),
         .an         (an)
     );
 
     //------------------------------------------------------------------
-    // 蜂鸣器告警（同上，tb 用 defparam 覆盖 BEEP_HALF_DIV）
+    // 蜂鸣器告警（同上，tb 用 defparam 覆盖节拍/载波分频）
+    //   beat 为节拍包络，同时送给 led_ctrl 做声光同步爆闪
     //------------------------------------------------------------------
+    wire beep_beat;
+
     buzzer_ctrl u_buzzer_ctrl (
         .clk      (clk),
         .rst_n    (rst_n),
         .alarm_on (disp_alarm),
-        .buzzer   (buzzer)
+        .buzzer   (buzzer),
+        .beat     (beep_beat)
     );
 
     //------------------------------------------------------------------
-    // LED 状态映射
-    //   告警（或自检）：16 颗全亮（最醒目的"光"告警）
-    //   正常：led[0]=state_code[0]，led[1]=state_code[1]，其余灭
+    // LED 效果引擎
+    //   告警（或自检）：16 颗随蜂鸣节拍同步爆闪（最醒目的声光告警）
+    //   状态 0/1/2   ：呼吸灯 / 环形流水 / KITT 扫描（详见 led_ctrl.v）
     //------------------------------------------------------------------
-    assign led = disp_alarm ? 16'hFFFF : {14'h0000, state_code[1], state_code[0]};
+    led_ctrl u_led_ctrl (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .state_code (state_code),
+        .alarm_on   (disp_alarm),
+        .beat       (beep_beat),
+        .led        (led)
+    );
 
     //------------------------------------------------------------------
     // UART 发送：本期不用，恒驱动空闲高电平

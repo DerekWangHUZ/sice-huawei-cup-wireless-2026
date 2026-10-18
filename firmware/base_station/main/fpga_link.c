@@ -76,6 +76,11 @@ esp_err_t fpga_link_init(void)
 
 esp_err_t fpga_link_send_cmd(uint8_t cmd, uint8_t p1, uint16_t p2)
 {
+    return fpga_link_send_cmd_ex(cmd, p1, p2, true);
+}
+
+esp_err_t fpga_link_send_cmd_ex(uint8_t cmd, uint8_t p1, uint16_t p2, bool verbose)
+{
     uint8_t  p2_lo = (uint8_t)(p2 & 0xFFu);
     uint8_t  p2_hi = (uint8_t)((p2 >> 8) & 0xFFu);
     uint8_t  x     = (uint8_t)(cmd ^ p1 ^ p2_lo ^ p2_hi);
@@ -108,11 +113,17 @@ esp_err_t fpga_link_send_cmd(uint8_t cmd, uint8_t p1, uint16_t p2)
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "TX cmd=0x%02X p1=0x%02X p2=0x%04X xor=0x%02X "
-                  "[%02X %02X %02X %02X %02X %02X %02X %02X]",
-             cmd, p1, p2, x,
-             frame[0], frame[1], frame[2], frame[3],
-             frame[4], frame[5], frame[6], frame[7]);
+    if (verbose) {
+        ESP_LOGI(TAG, "TX cmd=0x%02X p1=0x%02X p2=0x%04X xor=0x%02X "
+                      "[%02X %02X %02X %02X %02X %02X %02X %02X]",
+                 cmd, p1, p2, x,
+                 frame[0], frame[1], frame[2], frame[3],
+                 frame[4], frame[5], frame[6], frame[7]);
+    } else {
+        /* 1Hz 周期遥测刷新：降到 DEBUG，避免刷屏 */
+        ESP_LOGD(TAG, "TX(tel) p1=0x%02X p2=0x%04X xor=0x%02X",
+                 p1, p2, x);
+    }
     return ESP_OK;
 }
 
@@ -129,4 +140,19 @@ esp_err_t fpga_link_send_clear(void)
 esp_err_t fpga_link_send_state(fall_state_t st)
 {
     return fpga_link_send_cmd(CMD_SET_STATE, (uint8_t)st, 0x0000);
+}
+
+esp_err_t fpga_link_send_state_telemetry(fall_state_t st, uint16_t mag_x100)
+{
+    /* 周期遥测刷新（1Hz）：与状态变化边沿发的是同一种帧，p2 携带合加速度
+     * 幅值（0.01g）。FPGA 侧对重复的 SET_STATE 完全幂等，只做锁存。
+     * 契约 §4.5。日志降到 DEBUG，避免 1Hz 刷屏。 */
+    return fpga_link_send_cmd_ex(CMD_SET_STATE, (uint8_t)st, mag_x100, false);
+}
+
+esp_err_t fpga_link_send_state_change(fall_state_t st, uint16_t mag_x100)
+{
+    /* 状态变化沿（契约 §4.5 第 1 条）：保留逐帧 INFO 日志，
+     * 作为"状态同步已下发"的验收信号。 */
+    return fpga_link_send_cmd_ex(CMD_SET_STATE, (uint8_t)st, mag_x100, true);
 }

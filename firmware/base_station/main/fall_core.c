@@ -156,6 +156,42 @@ uint32_t fall_gyro_magnitude2(const int16_t gyro[3])
     return x * x + y * y + z * z;
 }
 
+/* 逐位整数开方（标准"移位-比较"算法），纯整数、无分支依赖浮点。
+ * 用于把 LSB² 的平方模长还原成 LSB 幅值。 */
+static uint32_t isqrt_u32(uint32_t v)
+{
+    uint32_t r = 0;
+    uint32_t bit = (uint32_t)1 << 30;   /* 最大偶数次幂 <= 2^32-1 */
+
+    while (bit > v) {
+        bit >>= 2;
+    }
+    while (bit != 0) {
+        if (v >= r + bit) {
+            v -= r + bit;
+            r = (r >> 1) + bit;
+        } else {
+            r >>= 1;
+        }
+        bit >>= 2;
+    }
+    return r;
+}
+
+uint16_t fall_acc_mag_centi_g(const int16_t acc[3])
+{
+    /* mag_lsb = |a| 的 LSB 幅值；1g = ACC_LSB_PER_G(2048) LSB
+     * 0.01g 单位 = |a|/2048*100 = |a|*100/2048
+     * mag_lsb 最大 ~56755（3 轴各 32768），*100 = 5.68e6，uint32 安全。 */
+    uint32_t mag_lsb = isqrt_u32(fall_acc_magnitude2(acc));
+    uint32_t centi   = (mag_lsb * 100u) / 2048u;
+
+    if (centi > 9999u) {
+        centi = 9999u;
+    }
+    return (uint16_t)centi;
+}
+
 const char *fall_state_name(fall_state_t s)
 {
     switch (s) {
