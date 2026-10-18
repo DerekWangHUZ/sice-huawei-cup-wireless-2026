@@ -250,14 +250,18 @@ int main(int argc, char **argv)
         printf("\n");
     }
 
-    /* 场景 4：冲击后爬起 —— 期望不进 CONFIRMED，回到 WALK */
+    /*
+     * 场景 4：冲击后爬起 —— 期望不进 CONFIRMED，回到 WALK
+     * 2026-10-18 起 PENDING 由 PENDING_MAX_MS(4s) 观察上限兜底退出
+     * （旧的 1.5s 快照窗口已废弃），故本场景数据延长到 4s 之后。
+     */
     {
         fall_state_t exp[] = { FALL_STATE_IDLE, FALL_STATE_WALK,
                                FALL_STATE_PENDING, FALL_STATE_WALK };
         printf("[4] scene: fall_recover\n");
         if (!run_scene("data/fall_recover.bin",
                        "impact then move -> back to WALK, NOT confirmed",
-                       exp, 4, dt_ms, 130, 0)) {
+                       exp, 4, dt_ms, 240, 0)) {
             failures++;
         }
         ran++;
@@ -474,6 +478,58 @@ int main(int argc, char **argv)
                    "(n=%d >= %d)\n",
                    n_big, n_small, (int)sizeof(small));
         } else {
+            failures++;
+        }
+        ran++;
+        printf("\n");
+    }
+
+    /*
+     * ======================================================================
+     * 以下为 2026-10-18 新增：PENDING 确认窗口修订回归（对照文献评审）
+     *   确认从"快照式"（只在冲击后恰满 STILL_WINDOW_MS 的那一帧看是否
+     *   静止）改为"持续静止计时 + PENDING_MAX_MS 观察上限"。
+     *   场景 12/13 是旧实现的两条漏报路径，14 是新上限的防误报回归。
+     * ======================================================================
+     */
+
+    /* 场景 12：冲击后挪动 2.2s 才静止 —— 旧逻辑漏报，新逻辑必须确认 */
+    {
+        fall_state_t exp[] = { FALL_STATE_IDLE, FALL_STATE_WALK,
+                               FALL_STATE_PENDING, FALL_STATE_CONFIRMED };
+        printf("[12] scene: fall_late_still (settle after 1.5s window)\n");
+        if (!run_scene("data/fall_late_still.bin",
+                       "late stillness still confirms (old logic missed)",
+                       exp, 4, dt_ms, 241, 0)) {
+            failures++;
+        }
+        ran++;
+        printf("\n");
+    }
+
+    /* 场景 13：窗口到期帧恰逢抽动 —— 旧逻辑漏报，新逻辑必须确认 */
+    {
+        fall_state_t exp[] = { FALL_STATE_IDLE, FALL_STATE_WALK,
+                               FALL_STATE_PENDING, FALL_STATE_CONFIRMED };
+        printf("[13] scene: fall_boundary_twitch (twitch at expiry)\n");
+        if (!run_scene("data/fall_boundary_twitch.bin",
+                       "twitch at window expiry does not lose the fall",
+                       exp, 4, dt_ms, 216, 0)) {
+            failures++;
+        }
+        ran++;
+        printf("\n");
+    }
+
+    /* 场景 14：碰撞后走动 3.2s 再坐下 —— 观察上限防误报，不得报警 */
+    {
+        fall_state_t exp[] = { FALL_STATE_IDLE, FALL_STATE_WALK,
+                               FALL_STATE_PENDING, FALL_STATE_IDLE };
+        printf("[14] scene: bump_walk_sit (no false alarm)\n");
+        if (!run_scene("data/bump_walk_sit.bin",
+                       "impact then walk then sit -> PENDING_MAX exit, "
+                       "NOT confirmed",
+                       exp, 4, dt_ms, 276, 0)) {
             failures++;
         }
         ran++;

@@ -116,13 +116,15 @@ def scene_fall_lying(n=130):
     return out
 
 
-def scene_fall_recover(n=130):
+def scene_fall_recover(n=240):
     """
     冲击后爬起（不应判定为跌倒）：
       前 25 帧  走动
       第 26 帧  冲击
-      之后      持续剧烈运动（角速度高），超过静止窗口
-    期望：IDLE -> WALK -> PENDING -> (窗口超时且仍运动) -> WALK
+      之后      持续剧烈运动（角速度高），直到 PENDING_MAX_MS(4s)
+                观察上限到期退出（2026-10-18 起上限取代旧的 1.5s 快照窗口，
+                故本场景数据需延长到 4s 之后）
+    期望：IDLE -> WALK -> PENDING -> (PENDING_MAX 到期且仍运动) -> WALK
           全程不进 CONFIRMED
     """
     out = []
@@ -161,12 +163,91 @@ def scene_fall_getup(n=160):
     return out
 
 
+def scene_fall_late_still():
+    """
+    冲击后持续挪动 2.2s 才静止（2026-10-18 新增回归）：
+      前 25 帧    走动
+      第 26 帧    冲击
+      之后 110 帧  持续运动（2.2s）—— 旧快照式确认会在此漏报
+      最后 105 帧  静止 -> 静止计时满 1500ms 确认（冲击后 3.7s，
+                  仍在 PENDING_MAX 4s 观察上限内）
+    期望：IDLE -> WALK -> PENDING -> CONFIRMED
+    """
+    out = []
+    base = 0
+    for i in range(25):
+        out.append((base + i * 20, (0.15, 1.10, 0.75), (60.0, 25.0, -18.0)))
+    base = 500
+    out.append((base, (3.4, -1.8, 2.6), (420.0, -260.0, 130.0)))
+    for i in range(1, 111):                        # 挪动 2.2s
+        out.append((base + i * 20, (0.9, 1.3, 0.8), (180.0, -120.0, 90.0)))
+    for i in range(111, 216):                      # 静止 -> 确认
+        out.append((base + i * 20, (0.05, 0.10, 0.98), (1.5, -1.0, 0.8)))
+    return out
+
+
+def scene_fall_boundary_twitch():
+    """
+    躺稳后恰在 1.5s 窗口到期瞬间抽动（2026-10-18 新增回归）：
+      前 25 帧    走动
+      第 26 帧    冲击
+      71 帧       躺平静止
+      5 帧        抽动（纯旋转 gyro=120°/s，恰好覆盖冲击+1500ms 的到期帧）
+      之后        重新躺平 -> 静止计时重启 -> 冲击后约 3.0s 确认
+    旧快照式确认会在到期帧看到"仍在运动"而退出 PENDING 漏报；
+    新实现只清零静止计时，重新躺平后照常确认。
+    期望：IDLE -> WALK -> PENDING -> CONFIRMED
+    """
+    out = []
+    base = 0
+    for i in range(25):
+        out.append((base + i * 20, (0.15, 1.10, 0.75), (60.0, 25.0, -18.0)))
+    base = 500
+    out.append((base, (3.4, -1.8, 2.6), (420.0, -260.0, 130.0)))
+    for i in range(1, 72):                         # 躺平 71 帧
+        out.append((base + i * 20, (0.05, 0.10, 0.98), (1.5, -1.0, 0.8)))
+    for i in range(72, 77):                        # 抽动 5 帧
+        out.append((base + i * 20, (0.05, 0.10, 0.98), (120.0, 0.0, 0.0)))
+    for i in range(77, 191):                       # 重新躺平 -> 确认
+        out.append((base + i * 20, (0.05, 0.10, 0.98), (1.5, -1.0, 0.8)))
+    return out
+
+
+def scene_bump_walk_sit():
+    """
+    碰撞后继续走动再坐下（2026-10-18 新增回归，PENDING_MAX 防误报）：
+      前 25 帧    走动
+      第 26 帧    碰撞冲击（如撞到门框，> 3g）
+      160 帧      继续走动（3.2s）
+      5 帧        坐下动作（仍在运动）
+      之后 85 帧   坐着静止 —— 到 PENDING_MAX(冲击+4s) 时坐下静止仅
+                  约 0.7s < STILL_WINDOW_MS，必须按非跌倒退出，绝不报警
+    期望：IDLE -> WALK -> PENDING -> IDLE（全程不进 CONFIRMED）
+    """
+    out = []
+    base = 0
+    for i in range(25):
+        out.append((base + i * 20, (0.15, 1.10, 0.75), (60.0, 25.0, -18.0)))
+    base = 500
+    out.append((base, (3.4, -1.8, 2.6), (420.0, -260.0, 130.0)))
+    for i in range(1, 161):                        # 继续走动 3.2s
+        out.append((base + i * 20, (0.15, 1.10, 0.75), (60.0, 25.0, -18.0)))
+    for i in range(161, 166):                      # 坐下动作 5 帧
+        out.append((base + i * 20, (0.30, 0.80, 1.10), (90.0, -40.0, 20.0)))
+    for i in range(166, 251):                      # 坐着静止
+        out.append((base + i * 20, (0.05, 0.35, 0.92), (1.2, -0.9, 0.7)))
+    return out
+
+
 SCENES = {
-    'idle':         scene_idle(),
-    'walk':         scene_walk(),
-    'fall_lying':   scene_fall_lying(),
-    'fall_recover': scene_fall_recover(),
-    'fall_getup':   scene_fall_getup(),
+    'idle':                 scene_idle(),
+    'walk':                 scene_walk(),
+    'fall_lying':           scene_fall_lying(),
+    'fall_recover':         scene_fall_recover(),
+    'fall_getup':           scene_fall_getup(),
+    'fall_late_still':      scene_fall_late_still(),
+    'fall_boundary_twitch': scene_fall_boundary_twitch(),
+    'bump_walk_sit':        scene_bump_walk_sit(),
 }
 
 
