@@ -18,13 +18,23 @@
 // 命令语义:
 //   0x01 ALARM     -> alarm_on  = 1
 //   0x02 CLEAR     -> alarm_on  = 0
-//   0x10 SET_STATE -> state_code = p1[1:0]
+//   0x10 SET_STATE -> state_code = p1[1:0]，mag_x100 = p2，mag_valid = 1
 //   其它命令码     -> 静默丢弃（无 cmd_valid、无 cmd_error、状态不变）
+//
+//   SET_STATE 的 p2 为 16 位遥测字：合加速度幅值，单位 0.01g（小端，
+//   p2_lo 在前）。0xFFFF 为"暂无有效遥测"哨兵，此时数码管读数位显示
+//   "----"。该字段自协议定稿起为保留位，S3 以边沿 + 1Hz 周期刷新方式
+//   发送；FPGA 侧对重复的 SET_STATE 完全幂等（只做锁存），因此周期刷新
+//   不产生任何副作用。见契约 §4.3 / §4.5。
 //
 // 接口说明 :
 //   byte_valid / byte_data   来自 uart_rx 的字节流（每个字节一拍脉冲）
 //   alarm_on    持续电平：告警中（驱动蜂鸣器 / 数码管 / LED）
 //   state_code  S3 判定状态编号 0..3，锁存直到下次 SET_STATE
+//   mag_x100    最近一次 SET_STATE 携带的合加速度幅值（0.01g 单位）
+//   mag_valid   最近一次 SET_STATE 的遥测是否有效（p2 != 0xFFFF）
+//   mag_update  单周期脉冲：收到一帧"有效遥测"的 SET_STATE（供 seg_display
+//               复位读数老化计时器；哨兵帧不产生该脉冲）
 //   cmd_valid   单周期脉冲：识别出一个合法且已知的命令帧
 //   cmd_error   单周期脉冲：帧头命中但校验/帧尾失败
 //
@@ -54,6 +64,9 @@ module cmd_decoder (
     input  wire [7:0] byte_data,
     output reg        alarm_on,
     output reg  [1:0] state_code,
+    output reg [15:0] mag_x100,
+    output reg        mag_valid,
+    output reg        mag_update,
     output reg        cmd_valid,
     output reg        cmd_error
 );
@@ -109,12 +122,16 @@ module cmd_decoder (
             shift      <= 64'h0;
             alarm_on   <= 1'b0;
             state_code <= 2'd0;
+            mag_x100   <= 16'd0;
+            mag_valid  <= 1'b0;
+            mag_update <= 1'b0;
             cmd_valid  <= 1'b0;
             cmd_error  <= 1'b0;
         end else begin
             // 脉冲信号默认拉低，仅命中当拍为高
-            cmd_valid <= 1'b0;
-            cmd_error <= 1'b0;
+            cmd_valid  <= 1'b0;
+            cmd_error  <= 1'b0;
+            mag_update <= 1'b0;
 
             if (byte_valid) begin
                 // 新字节从低位进入窗口，最早字节从高位滑出
@@ -125,7 +142,14 @@ module cmd_decoder (
                     case (n2)
                         CMD_ALARM:     alarm_on   <= 1'b1;
                         CMD_CLEAR:     alarm_on   <= 1'b0;
-                        CMD_SET_STATE: state_code <= n3[1:0];
+                        CMD_SET_STATE: begin
+                            state_code <= n3[1:0];
+                            mag_x100   <= {n5, n4};   // p2 小端：低字节在前
+                            // 0xFFFF = "暂无有效遥测"哨兵 -> 数码管显示 "----"
+                            mag_valid  <= ({n5, n4} != 16'hFFFF);
+                            // 只有"有效遥测"才刷新 seg_display 的老化计时器
+                            mag_update <= ({n5, n4} != 16'hFFFF);
+                        end
                         default: ;
                     endcase
                 end else if (hdr_now && !frame_now) begin

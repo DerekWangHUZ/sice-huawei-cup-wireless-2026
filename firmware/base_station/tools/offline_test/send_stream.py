@@ -17,10 +17,18 @@ send_stream.py -- 上板发假包工具（穿戴端不在场时的免等待自�
   python send_stream.py fall_lying --rate=50 --loop
   python send_stream.py bad_frames           # 发坏帧，观察 frames_bad 增长
 
-期望现象（详见下载文件夹中的《上机操作说明-跌倒报警联调.md》）：
-  walk         -> 串口日志 STATE IDLE -> WALK；FPGA 数码管显示 1
-  fall_lying   -> 串口日志 -> CONFIRMED；FPGA 数码管闪 FALL--、蜂鸣器响、LED 全亮
+期望现象（详见下载文件夹中的《上机操作说明-基站烧录与联调全流程.md》）：
+  walk         -> 串口日志 STATE IDLE -> WALK；FPGA 数码管 "Go" + 实时合加速度读数
+                  （约 Go01.0x，随步态起伏）+ LED 环形流水；OLED 大字「行走」
+  fall_lying   -> 串口日志 -> CONFIRMED；FPGA 数码管 "AL" + 冲击幅值（读数在
+                  CONFIRMED 期间定格，如 AL03.40）整屏急闪、
+                  蜂鸣器三短一停鸣响、16 颗 LED 随节拍爆闪；
+                  OLED 大字「跌倒告警」2Hz 反色闪烁
   bad_frames   -> 串口 STATS 中 frames_bad 增长，frames_ok 不变
+
+数码管读数说明（契约 §4.8）：an[5]an[4] = 状态助记符（St/Go/Pd/AL），
+  an[3..0] = 合加速度幅值 "XX.XX" g（an[2] 的小数点即小数点）。
+  基站在收不到有效帧时发 0xFFFF 哨兵，读数位显示 "----"。
 """
 
 import socket

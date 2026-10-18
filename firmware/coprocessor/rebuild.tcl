@@ -164,6 +164,8 @@ set obj [get_filesets sources_1]
 # Add local files from the original project (-no_copy_sources specified)
 # NOTE: file list updated 2026-10-15 for the fall-detect alarm chain.
 #       uart_rx / cmd_decoder / seg_display / buzzer_ctrl added alongside top.
+#       2026-10-18: led_ctrl.v added (LED effect engine: breathing / chase /
+#       KITT scan / beep-synced strobe).
 #       Keep in sync with rtl/*.v -- adding or
 #       removing a source file requires re-exporting this script.
 set files [list \
@@ -171,6 +173,7 @@ set files [list \
  [file normalize "${origin_dir}/rtl/cmd_decoder.v" ]\
  [file normalize "${origin_dir}/rtl/seg_display.v" ]\
  [file normalize "${origin_dir}/rtl/buzzer_ctrl.v" ]\
+ [file normalize "${origin_dir}/rtl/led_ctrl.v" ]\
  [file normalize "${origin_dir}/rtl/top.v" ]\
 ]
 set added_files [add_files -fileset sources_1 $files]

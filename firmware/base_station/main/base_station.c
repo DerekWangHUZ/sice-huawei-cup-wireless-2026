@@ -79,6 +79,12 @@ static const uint8_t SNAP_CMD[4] = { 0x55, 0xAA, 0x01, 0xFF };
 /* 统计打印周期 */
 #define STATS_PERIOD_MS  5000u
 
+/* FPGA 数码管遥测刷新周期（契约 §4.5）。
+ * 状态帧按"变化沿"发送，但数码管读数需要持续刷新才能反映实时运动；
+ * 这里以 1Hz 重发 SET_STATE（p1=当前状态码，p2=合加速度幅值）。
+ * 对 FPGA 完全幂等：cmd_decoder 只做锁存，不产生任何动作。 */
+#define FPGA_TEL_PERIOD_MS  1000u
+
 /* --- 全局统计（原始日志用） --- */
 static uint32_t g_frames_ok   = 0;
 static uint32_t g_frames_bad  = 0;
@@ -208,6 +214,7 @@ static void handle_state_change(int sock,
                                 fall_state_t *last_state,
                                 fall_state_t st,
                                 uint16_t seq,
+                                uint16_t mag_x100,
                                 uint32_t now_ms)
 {
     if (st == *last_state) {
@@ -223,17 +230,56 @@ static void handle_state_change(int sock,
              (unsigned)now_ms);
 
     if (st == FALL_STATE_CONFIRMED) {
-        /* 确认跌倒：告警 + 抓拍 */
+        /* 确认跌倒：告警 + 抓拍。
+         * 契约 §4.5 第 2 条：确认跌倒后只发 ALARM，绝不发 SET_STATE(3)；
+         * 后续的周期遥测也会在 CONFIRMED 期间自动停发，使数码管读数
+         * 冻结在冲击那一刻的幅值上。 */
         fpga_link_send_alarm();
         send_snapshot_cmd(sock);
     } else if (*last_state == FALL_STATE_CONFIRMED) {
         /* 离开告警态：解除 */
         fpga_link_send_clear();
     } else {
-        /* 其它迁移：同步状态显示 */
-        fpga_link_send_state(st);
+        /* 其它迁移：同步状态显示（携带当前幅值，避免读数滞后一次刷新）。
+         * 注意用 verbose 版本：状态变化沿是验收信号，日志里必须有
+         * `TX cmd=0x10 p1=...`（见 docs/成员A任务状态.md 的"状态同步"行）；
+         * 静默只用于 1Hz 周期刷新，避免刷屏。 */
+        fpga_link_send_state_change(st, mag_x100);
     }
     *last_state = st;
+}
+
+/* ==========================================================================
+ * 周期遥测刷新（契约 §4.5）：1Hz 重发 SET_STATE 携带合加速度幅值，
+ * 让数码管读数持续反映实时运动。
+ *
+ * 三条约束：
+ *   1) CONFIRMED 期间不发 —— 保持"确认跌倒后只发 ALARM"的既有语义，
+ *      同时让告警画面上的读数定格为冲击幅值；
+ *   2) 无有效帧（data timeout 分支）时发 0xFFFF 哨兵，让 FPGA 显示 "----"
+ *      而不是把上一次的读数伪装成当前值；
+ *   3) FPGA 链路未就绪时直接跳过。
+ * ========================================================================== */
+static void fpga_telemetry_tick(const fall_detector_t *det,
+                                uint16_t mag_x100,
+                                bool data_fresh,
+                                uint32_t now_ms,
+                                uint32_t *last_tel_ms)
+{
+    if (!g_fpga_ok || det->state == FALL_STATE_CONFIRMED) {
+        return;
+    }
+    if (*last_tel_ms == 0) {
+        *last_tel_ms = now_ms;
+        return;
+    }
+    if (now_ms - *last_tel_ms < FPGA_TEL_PERIOD_MS) {
+        return;
+    }
+    *last_tel_ms = now_ms;
+
+    fpga_link_send_state_telemetry(det->state,
+                                   data_fresh ? mag_x100 : FPGA_TEL_NO_DATA);
 }
 
 /* ==========================================================================
@@ -267,6 +313,14 @@ static void udp_pose_task(void *arg)
     /*
      * 收包超时 100ms：数据流停摆时任务也要周期醒来跑 fall_detector_tick，
      * 保证告警超时解除/掉线保护不依赖"下一帧到达"（实测缺陷修复）。
+     *
+     * 2026-10-18 实测注记（未改代码，仅记录）：本 IDF 构建下该超时实测**不生效**
+     * ——25s 无数据时该分支一次都没跑过（真机日志只在"下一帧到达"时才判定掉线，
+     * 与设计的 3s 超时不符）。曾试用 select() 显式超时替代，实机表现相同，
+     * 因无法在无数据场景下验证而**回退**，以免改动已实测通过的主链路。
+     * 影响范围：仅"完全没有数据到达"时的空闲路径（掉线保护 tick、遥测哨兵）。
+     * 数码管读数不会因此显示过期值——FPGA 侧已自行做 3s 遥测老化（见
+     * rtl/seg_display.v 的 TELEM_STALE_DIV），不依赖 S3 的这条路径。
      */
     struct timeval rx_timeout = { .tv_sec = 0, .tv_usec = 100 * 1000 };
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rx_timeout, sizeof(rx_timeout));
@@ -277,13 +331,18 @@ static void udp_pose_task(void *arg)
 
     fall_state_t last_state   = det.state;
     uint32_t     last_stats_ms = 0;
+    uint16_t     last_mag_x100 = 0;      /* 最近一次合加速度幅值（0.01g） */
+    uint32_t     last_tel_ms   = 0;      /* 上次遥测刷新时刻 */
 #if ENABLE_OLED
     /* 仅 OLED 状态快照需要记住最近序号；模块关闭时不声明，避免未使用告警 */
     uint16_t     last_seq      = 0;
 #endif
 
-    /* 上电首帧：同步初始状态到 FPGA（契约 §4.5 第 3 条） */
-    fpga_link_send_state(last_state);
+    /* 上电首帧：同步初始状态到 FPGA（契约 §4.5 第 3 条）。
+     * 此时还没有任何传感器数据，遥测用哨兵 -> 数码管读数显示 "----"。
+     * 这一帧走 verbose 版本，让日志里能看到上电首帧同步（验收信号）；
+     * 后续 1Hz 遥测刷新走静默版本，不刷屏。 */
+    fpga_link_send_cmd(0x10u, (uint8_t)last_state, FPGA_TEL_NO_DATA);
 
     uint8_t rxbuf[128];
 
@@ -297,7 +356,9 @@ static void udp_pose_task(void *arg)
              * 状态机解除 -> 照常走状态变化沿下发 CLEAR/SET_STATE。
              */
             fall_state_t st = fall_detector_tick(&det, now_ms);
-            handle_state_change(sock, &det, &last_state, st, 0, now_ms);
+            handle_state_change(sock, &det, &last_state, st, 0,
+                                FPGA_TEL_NO_DATA, now_ms);
+            fpga_telemetry_tick(&det, last_mag_x100, false, now_ms, &last_tel_ms);
 #if ENABLE_OLED
             status_publish(&det, last_seq);
 #endif
@@ -321,6 +382,9 @@ static void udp_pose_task(void *arg)
 
             g_frames_ok++;
 
+            /* 合加速度幅值（0.01g）——遥测用，纯整数换算，无浮点 */
+            last_mag_x100 = fall_acc_mag_centi_g(frame.acc);
+
             /* CSI 占位：真实实现在此更新统计量 */
             csi_feed_packet();
 
@@ -331,7 +395,8 @@ static void udp_pose_task(void *arg)
                                                  now_ms);
 
             /* 状态变化沿 -> 下发控制帧（契约 §4.5） */
-            handle_state_change(sock, &det, &last_state, st, frame.seq, now_ms);
+            handle_state_change(sock, &det, &last_state, st, frame.seq,
+                                last_mag_x100, now_ms);
 
 #if ENABLE_OLED
             last_seq = frame.seq;
@@ -363,6 +428,9 @@ static void udp_pose_task(void *arg)
 #endif
         }
 
+        /* 1Hz 遥测刷新：让 FPGA 数码管读数持续反映实时合加速度（契约 §4.5） */
+        fpga_telemetry_tick(&det, last_mag_x100, true, now_ms, &last_tel_ms);
+
         /* 周期统计（原始日志，供验收查） */
         if (last_stats_ms == 0) {
             last_stats_ms = now_ms;
@@ -370,18 +438,23 @@ static void udp_pose_task(void *arg)
             last_stats_ms = now_ms;
 #if ENABLE_SD_LOG
             ESP_LOGI(TAG, "STATS packets=%u frames_ok=%u frames_bad=%u "
-                          "state=%s sd_drop=%u",
+                          "state=%s mag=%u.%02ug sd_drop=%u",
                      (unsigned)g_packets,
                      (unsigned)g_frames_ok,
                      (unsigned)g_frames_bad,
                      fall_state_name(det.state),
+                     (unsigned)(last_mag_x100 / 100u),
+                     (unsigned)(last_mag_x100 % 100u),
                      (unsigned)sd_log_dropped());
 #else
-            ESP_LOGI(TAG, "STATS packets=%u frames_ok=%u frames_bad=%u state=%s",
+            ESP_LOGI(TAG, "STATS packets=%u frames_ok=%u frames_bad=%u "
+                          "state=%s mag=%u.%02ug",
                      (unsigned)g_packets,
                      (unsigned)g_frames_ok,
                      (unsigned)g_frames_bad,
-                     fall_state_name(det.state));
+                     fall_state_name(det.state),
+                     (unsigned)(last_mag_x100 / 100u),
+                     (unsigned)(last_mag_x100 % 100u));
 #endif
         }
     }

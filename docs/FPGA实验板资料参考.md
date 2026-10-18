@@ -169,6 +169,75 @@ set_property IOSTANDARD  LVCMOS33 [get_ports buzzer]
 
 ---
 
+## 9b. 配置 Flash 与上电启动（掉电持久化）
+
+> 2026-10-18 补充。`Program Device`（JTAG）写的是 **FPGA 内部 SRAM，掉电即失**；
+> 要让板子自己从 Flash 启动，须把比特流写进板载配置 Flash。
+
+- **器件**：Vivado 硬件管理器自动识别为 Micron **N25Q32-3.3V**（ID：Mfg `20` /
+  Type `ba` / Cap `16`），对应 `get_cfgmem_parts` 中的
+  **`n25q32-3.3v-spi-x1_x2_x4`**（32Mbit = 4MB）。
+- **生成烧写文件**：`write_cfgmem -format mcs -size 32 -interface SPIx1`（见
+  `firmware/coprocessor/gen_mcs.tcl`）。`-size 32` 对应 32Mbit；
+  `SPIx1` 与工程默认 `SPI_BUS_WIDTH=1` 一致，最保守可靠。
+- **烧写入口**：GUI 的 **Program Configuration Memory Device**（只接受
+  `.mcs`/`.bin`，**不接受 `.bit`**），或仓库内的无头脚本
+  `firmware/coprocessor/program_mcs.tcl`。
+  后者内部会先加载 Vivado 自带的 SPI 桥接位流
+  （`spi_xc7a35t_pullnone.bit`，位于 Vivado 安装目录
+  `data/xicom/cfgmem/`），这是 JTAG 间接访问 Flash 的必要前置步骤；
+  GUI 会自动完成这一步，手写 Tcl 时容易漏掉（漏掉时报的错是
+  `[Labtools 27-3347] Failure to set flash parameters`，该提示有误导性，
+  真实原因见 `readback_hw_cfgmem` 的 `27-3138 indirect programming
+  bitstream was not found`）。
+- **改 RTL 后必须重新固化**，否则上电仍跑旧比特流；只想立刻看现象可继续用
+  JTAG 下载（掉电即失，不影响 Flash 内容）。
+
+### ⚠️ 已知问题：上电不会自动触发配置（当前无法修复）
+
+**现象**：Flash 烧写成功并通过校验后，断电再上电时板子**不会自动启动**——
+`DONE` 保持为 0，数码管/LED/蜂鸣器全无反应。**手动按一下板上 CONFIG 按钮**，
+立即正常启动并运行 Flash 中的设计。
+
+**这个现象本身已经排除了以下可能**（按下 CONFIG 能起来即可证明）：
+
+| 已排除 | 依据 |
+|---|---|
+| Flash 内容/比特流有问题 | 按 CONFIG 能正常加载运行 |
+| 启动模式（MSEL）不对 | 按 CONFIG 说明确实在读 SPI Flash |
+| 烧写方式/工具链有问题 | `Erase`/`Program`/`Verify` 全部成功，读回校验一致 |
+| mcs 格式有问题 | 与 Vivado 自带样例 `ac701_test.mcs` 结构逐字段一致 |
+
+**唯一失效的环节是"上电瞬间的自动触发"**。CONFIG 按钮接的是 FPGA 的
+`PROGRAM_B`（低有效配置复位）；它能手动生效、上电却不生效，指向板级的
+上电复位电路/电源上升沿问题，属**硬件层面**。
+
+**已尝试且无效**的方案：
+
+- 在 XDC 中设置 `BITSTREAM.CONFIG.PROGPIN/INITPIN/DONEPIN = Pull-up`
+  （想让 FPGA 内部弱上拉替代板上外部上拉）——实测无效，已回退。
+- 检查/修正 `CFGBVS` 与 `CONFIG_VOLTAGE` 属性（此项**已保留**，它修正了
+  DRC 的 `CFGBVS-1` 真实告警，但与本次现象无关）。
+
+**历史事实**：该板在 2026-10-18 之前**无需按 CONFIG，上电即自动启动**。
+本次改动未触及任何配置电路相关约束（`pins.xdc` 的引脚分配、
+`gen_mcs.tcl`、`bitstream` 生成参数均未改变），**但无法定位到具体致因，
+按现状无法修复**。
+
+**当前可行的绕过方式**（均需人工或额外硬件）：
+
+1. 上电后按一次 CONFIG 按钮（最简单，已验证有效）。
+2. 用 `program_bit.tcl` 经 JTAG 下载（需要电脑，不满足"脱离电脑"要求）。
+
+**若要实现全自动而又不动配置电路**，可考虑用 ESP32-S3 的一个空闲 GPIO
+接 FPGA 的 `PROGRAM_B`，上电后由 S3 主动拉低 100ms 再释放，等效于按一次
+CONFIG。此方案需增加一根飞线，**本期未实施**。
+
+- 烧写失败不会损坏 JTAG 通路：配置 Flash 内容异常时 FPGA 只是不启动，
+  仍可用 `program_bit.tcl` 重新下载恢复现场。
+
+---
+
 ## 10. 最小可复用 XDC（时钟 + 复位 + 16 LED）
 
 新建工程后，把下面内容直接贴进 `pins.xdc`（按需再补 UART / 键盘 / 数码管 / DAC）：

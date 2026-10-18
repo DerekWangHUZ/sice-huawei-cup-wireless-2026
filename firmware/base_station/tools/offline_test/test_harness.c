@@ -536,6 +536,58 @@ int main(int argc, char **argv)
         printf("\n");
     }
 
+    /*
+     * 场景 15：数码管遥测换算 fall_acc_mag_centi_g()
+     *
+     * 该函数的输出会经 SET_STATE 的 p2 送到 FPGA，直接决定数码管上
+     * "XX.XX" 那四位的数值，因此必须逐点锁死（契约 §4.3）。
+     *   1g   = 2048 LSB -> 100  (显示 01.00)
+     *   2g   = 4096 LSB -> 200
+     *   负值按绝对值
+     *   三轴合成 1024/1024/1024 -> 86
+     * int16 输入下的理论最大值 = 三轴各 32767 -> 2771 (27.71g)，
+     * 远小于 0xFFFF(65535)，所以协议里用 0xFFFF 作"暂无遥测"哨兵
+     * 不会有歧义 —— 这一点由本场景一并钉住。
+     */
+    {
+        struct { int16_t acc[3]; uint16_t expect; const char *desc; } cases[] = {
+            { { 0, 0, 2048 },      100u, "1.00g on Z"          },
+            { { 0, 0, 4096 },      200u, "2.00g on Z"          },
+            { { 0, 0, -2048 },     100u, "negative axis uses |a|" },
+            { { 2048, 0, 0 },      100u, "1.00g on X"          },
+            { { 0, 0, 0 },           0u, "zero vector"         },
+            { { 1024, 1024, 1024 }, 86u, "3-axis 0.5g each"    },
+            { { 32767, 32767, 32767 }, 2771u, "int16 maximum"   },
+        };
+        int ncase = (int)(sizeof(cases) / sizeof(cases[0]));
+        int k;
+        int ok = 1;
+
+        printf("[15] telemetry conversion fall_acc_mag_centi_g\n");
+        for (k = 0; k < ncase; k++) {
+            uint16_t got = fall_acc_mag_centi_g(cases[k].acc);
+            printf("  %-24s -> %5u (expect %5u)\n",
+                   cases[k].desc, (unsigned)got, (unsigned)cases[k].expect);
+            if (got != cases[k].expect) {
+                printf("  ASSERT FAILED: %s\n", cases[k].desc);
+                ok = 0;
+            }
+        }
+        /* 哨兵无歧义：任何合法输入都到不了 0xFFFF */
+        if (cases[ncase - 1].expect == 0xFFFFu) {
+            printf("  ASSERT FAILED: max value collides with no-data sentinel\n");
+            ok = 0;
+        }
+        if (ok) {
+            printf("  [PASS] %d conversion case(s) exact, sentinel unambiguous\n",
+                   ncase);
+        } else {
+            failures++;
+        }
+        ran++;
+        printf("\n");
+    }
+
     printf("=========================================\n");
     if (failures == 0) {
         printf(" OFFLINE TEST: ALL %d SCENARIOS PASSED\n", ran);

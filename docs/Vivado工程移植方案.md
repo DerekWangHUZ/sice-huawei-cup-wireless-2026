@@ -6,12 +6,14 @@
 
 ```text
 firmware/coprocessor/
-├── rtl/            # RTL 源码（uart_rx / cmd_decoder / seg_display / buzzer_ctrl / top）
+├── rtl/            # RTL 源码（uart_rx / cmd_decoder / seg_display / buzzer_ctrl / led_ctrl / top）
 ├── constrs/        # pins.xdc
 ├── sim/            # tb_top.v + run_sim.ps1（无头仿真）
 ├── rebuild.tcl     # 重建工程（原地生成 coprocessor.xpr，-force 可重复执行）
 ├── build_bit.tcl   # 无头综合+实现+出比特流（产物 coprocessor.runs/impl_1/top.bit）
-└── gen_mcs.tcl     # 无头生成 top.mcs（供固化到板载配置 Flash）
+├── program_bit.tcl # 无头 JTAG 下载 top.bit（掉电即失，需板子接 JTAG）
+├── gen_mcs.tcl     # 无头生成 top.mcs（供固化到板载配置 Flash）
+└── program_mcs.tcl # 无头把 top.mcs 烧进板载配置 Flash（掉电不丢，需板子接 JTAG）
 ```
 
 RTL 与约束直接放在 `rtl/`、`constrs/`，与 Vivado 生成的工程数据目录
@@ -37,12 +39,47 @@ vivado -mode batch -source build_bit.tcl
 # 产物: coprocessor.runs/impl_1/top.bit
 ```
 
+无头 JTAG 下载（等效 GUI 的 Program Device，**掉电即失**；改完代码想立刻看现象用这条）：
+
+```bash
+vivado -mode batch -source program_bit.tcl
+# 成功标志: PROGRAM_OK + "End of startup status: HIGH"
+# 未接板/接错板: NO_DEVICE / PART_MISMATCH（脚本会拒绝，不会误写别的器件）
+```
+
 固化到板载配置 Flash 所需的 `top.mcs`：
 
 ```bash
 vivado -mode batch -source gen_mcs.tcl
 # 产物: coprocessor.runs/impl_1/top.mcs
 ```
+
+**固化到板载配置 Flash（掉电不丢）**：
+
+```bash
+vivado -mode batch -source program_mcs.tcl
+# 成功标志: MCS_PROGRAM_OK
+# 未接板/接错板: NO_DEVICE / PART_MISMATCH；器件不匹配: CFGMEM_PART_MISSING
+# 缺 mcs: MCS_MISSING（先跑 gen_mcs.tcl）
+```
+
+- 烧写对象是板载配置 Flash（本板自动识别为 `n25q32-3.3v-spi-x1_x2_x4`，
+  与 `gen_mcs.tcl` 的 `-size 32 / SPIx1` 对应），**不是** FPGA 内部 SRAM。
+- 脚本会自动加载 Vivado 自带的 SPI 桥接位流
+  （`spi_xc7a35t_pullnone.bit`，位于 Vivado 安装目录的
+  `data/xicom/cfgmem/bitfile.zip`）。这是 JTAG 间接访问 Flash 的必要前置步骤：
+  GUI 会自动做，手写 Tcl 若遗漏会报
+  `[Labtools 27-3347] Failure to set flash parameters`（该提示有误导性）。
+- **改完 RTL 必须重新 `gen_mcs.tcl` + `program_mcs.tcl`**，否则 Flash 里仍是旧
+  比特流；只想立刻看现象仍可用 `program_bit.tcl`（那次有效，掉电即失）。
+- ⚠️ **本板已知问题**：烧写成功（`Erase`/`Program`/`Verify` 全过、读回一致）后，
+  断电再上电**仍不会自动启动**，需要**按一次板上 CONFIG 按钮**。
+  该现象与比特流、Flash 内容、mcs 格式、烧写方式均无关（按 CONFIG 能正常
+  运行即可证明），指向板级上电复位电路。详见
+  [`FPGA实验板资料参考.md`](FPGA实验板资料参考.md) §9b 的"已知问题"小节。
+
+> 若 `vivado` 不在 PATH（本机默认如此），用安装目录下的 `bin\vivado.bat` 全路径调用，
+> 例如 `C:\AMDDesignTools\2026.1\Vivado\bin\vivado.bat -mode batch -source program_mcs.tcl`。
 
 ---
 
