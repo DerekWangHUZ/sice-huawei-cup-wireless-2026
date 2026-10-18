@@ -2,10 +2,26 @@
 
 ---
 
+## 2026-10-18 判定逻辑修订（对照文献评审）
+
+对照业界同类实现（KFall 数据集 ESP32+SVM 项目、Kepski & Kwolek 2017 等）
+评审判定算法，落地两项修订 + 一项可选钩子（依据与论证见
+[CHANGELOG.md](CHANGELOG.md) 同日条目）：
+
+| 项 | 内容 |
+|---|---|
+| P0 确认逻辑修订 | PENDING 改"持续静止计时 + PENDING_MAX_MS(4s) 观察上限"，修复快照式确认的两条漏报路径（到期帧恰逢抽动 / 静止晚于到期才出现） |
+| P1 姿态门（默认关） | `POSTURE_CHECK_ENABLE=0`：确认前检查重力方向与自校准竖直参考夹角 >60°，压"快速坐下"误报；未校准 fail-open；**待佩戴位置定死后开启** |
+| P2 阈值依据 | `IMPACT_THRESH_G` 保持 3.0g（压误报优先），注释补文献依据（学术 2.5g / KFall 3.0g→recall 0.827）；调参建议交成员 C（SD 卡 CSV 阈值扫描） |
+| 回归 | 离线自测 11 -> **14 场景全过**：新增 fall_late_still / fall_boundary_twitch（旧逻辑漏报，新逻辑确认）、bump_walk_sit（观察上限防误报）；fall_recover 数据延长至 4s 上限到期；fall_lying 确认时刻 2020ms -> 2040ms（+1 帧，迁移序列不变） |
+| 待办 | 真机回归（用 `send_stream.py` 同一批合成帧重推）；成员 B 定佩戴位置后评估开启姿态门 |
+
+---
+
 ## 2026-10-17 新增：OLED 状态显示 + microSD 数据记录
 
 1.3" 四脚 I2C OLED 与六脚 microSD 模块到货，已接入基站固件。
-**代码：编译 + 离线验证通过；上板：OLED 上线、四幕联调通过，SD 记录未通过**（见下方真机记录）。
+**代码：编译 + 离线验证通过；上板：OLED 上线、四幕联调通过、SD 记录打通**（见下方真机记录）。
 
 | 项 | 内容 |
 |---|---|
@@ -55,30 +71,31 @@
 → **结论：新增两个模块没有让已验证的主链路回归。** 冲击阈值、确认帧号、时间窗、
 下行帧字节这些决定安全性的值全部吻合。
 
-**④ SD 记录：未通过，原因未定案**
+**④ SD 记录：已通过**
 
-| 情况 | 日志签名 | 含义 |
-|---|---|---|
-| 卡在位 | `cmd=52/5` 有 R1 响应 → `failed to mount card (13)` | FatFs `FR_NO_FILESYSTEM` —— **卡识别与 SPI 通信正常** |
-| 卡取出 | `sdmmc_card_init failed (0x107)` | `ESP_ERR_TIMEOUT` —— 与"卡在位"签名完全不同 |
+真机实测（`DATA_004.CSV` 开头）：
 
-- "卡识别正常"是源码级判据：IDF 的 `vfs_fat_sdmmc.c` 中 `sdmmc_card_init` 在 `f_mount` **之前**，
-  而日志只有 `failed to mount card`、没有 `sdmmc_card_init failed`；
-- **已排除 SPI 时钟**：`SD_MAX_FREQ_KHZ` 由 20000 降到 10000 重烧，报错一字不变；
-- 已知硬约束：IDF v6.1 的 FatFs **`FF_FS_EXFAT` 写死为 0**（无对应 Kconfig），**不支持 exFAT**；
-- 待定案：卡主确认该卡为 FAT32，故需 **dump 扇区 0** 看是否为 GPT 分区表 / 引导扇区异常。
-  **卡目前被取出（卡上有数据待归档），复测放到下一轮**。
+```
+Timestamp_ms,Seq,AccX,AccY,AccZ,GyroX,GyroY,GyroZ,CSI_Variance,State
+24026,0,41,61,2048,8,-7,5,0,0
+24047,1,41,61,2048,8,-7,5,0,0
+24067,2,41,61,2048,8,-7,5,0,0
+```
 
-**⑤ 降级设计：真机确认有效**
+- 表头与契约 §2.1 逐字节一致，共 10 字段；
+- `Seq` 0,1,2… 连续无跳号 → 写入无损坏；
+- `Acc = 41/61/2048` 正是 idle 场景 0.02g/0.03g/1.0g 的原始 ADC 值 → 数值链路正确；
+- 时间戳 ~20ms 递增（50Hz）；`CSI_Variance` 占位 0；`State` 0 = IDLE；
+- 文件名递增：`DATA_001` → `DATA_008`（每次上电取卡上最大编号 +1）。
 
-SD 挂载失败时只输出 `SDLOG: mount /sdcard failed` +
-`BASE: sd log init failed, data recording disabled`，随后 SoftAP / UDP 收包 / 跌倒判定 /
+**⑤ 降级设计：真机已确认**
+
+SD / OLED 任一初始化失败时只禁用自身功能，SoftAP / UDP 收包 / 跌倒判定 /
 OLED / FPGA 下行**全部照常工作** —— 与设计预期一致。
 
 **⑥ 本次未覆盖**
 
 - **FPGA 未接**：声光致动未验（只验到"FPGA 会收到什么帧"，字节级）；
-- **SD 记录未验**（挂载未通过）；
 - **OLED 屏内容未目视**。
 
 ### 上板后更新的事实

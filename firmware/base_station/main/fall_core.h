@@ -60,8 +60,10 @@ void posture_parser_reset(void);
  *
  * 规则依据 docs/团队协作规范与接口契约.md §2.2（成员 C 交付的三段式逻辑）：
  *   1) 冲击段：合加速度 |a| > IMPACT_THRESH_G
- *   2) 静止段：冲击后 STILL_WINDOW_MS 内姿态稳定（角速度低 + 加速度回到重力附近）
- *   3) 判定：满足静止段 -> 确认跌倒
+ *   2) 静止段：冲击后【持续】静止满 STILL_WINDOW_MS
+ *      （角速度低 + 加速度回到重力附近；被运动打断则计时清零）
+ *   3) 判定：持续静止段满 -> 确认跌倒；
+ *      冲击后 PENDING_MAX_MS 内未满足则按非跌倒退出
  *
  * 传感器换算（MPU6050 直接传 ADC 原始值）：
  *   加速度 ±16g 量程，16 位有符号 -> 1g = 32768/16 = 2048 LSB
@@ -74,11 +76,33 @@ void posture_parser_reset(void);
 
 /* --- 可调阈值（成员 C 调参后直接改这里即可生效） --- */
 
-/* 冲击阈值：合加速度超过此值认为发生撞击。3.0g */
+/*
+ * 冲击阈值：合加速度超过此值认为发生撞击。3.0g
+ * 依据（2026-10-18 文献对照，详见 CHANGELOG 同日条目）：
+ *  - 学术阈值法常用 2.5g（Kepski & Kwolek, IET 2017：SV_total > 2.5g 判冲击）；
+ *  - KFall 数据集门限扫描：gate=3.0g 时 fall recall 仅 0.827（漏约 17%），
+ *    gate=1.7g 时 0.896 —— 3.0g 偏高，缓慢跌倒（扶墙滑下/晕倒）可能达不到；
+ *  - 本期保持 3.0g：演示场景优先压误报（快速坐下冲击可达 2~4g）。
+ *    调参建议：成员 C 拿 SD 卡 CSV 对真实动作做阈值扫描后再决定是否下调。
+ */
 #define IMPACT_THRESH_G        3.0f
 
-/* 静止确认窗口：冲击后在此时间内姿态保持静止则确认跌倒。1500ms */
+/*
+ * 静止确认窗口：冲击后【持续】静止满此时长则确认跌倒。1500ms
+ * 2026-10-18 修订：确认按"持续静止计时"执行（静止被运动打断即清零），
+ * 不再是"冲击后恰满此时长的那一帧是否静止"的快照式判定——后者在
+ * 到期帧恰逢抽动、或静止晚于到期才出现时会漏报（对照文献
+ * post-fall-inactivity 标准做法，详见 CHANGELOG）。
+ */
 #define STILL_WINDOW_MS        1500u
+
+/*
+ * 冲击后观察上限：进入 PENDING 后持续这么久（无论动或不动）仍未确认，
+ * 则按非跌倒退出（回到 WALK/IDLE）。2026-10-18 新增。
+ * 作用：配合"持续静止计时"的确认方式，防止"碰撞后继续走动、随后才
+ * 坐下静止"在长观察期内被误确认——到期时坐下静止尚不足 STILL_WINDOW_MS。
+ */
+#define PENDING_MAX_MS         4000u
 
 /* 静止判据：窗口内角速度模长低于此值（°/s） */
 #define STILL_GYRO_DPS         50.0f
@@ -108,6 +132,29 @@ void posture_parser_reset(void);
 /* 起身判据：持续活动这么久才解除（过滤翻身等短暂动作）。400ms */
 #define GETUP_HOLD_MS          400u
 
+/*
+ * 姿态门（2026-10-18 新增，默认关闭）：
+ *   文献对照结论：|a| 模长判据无法区分"快速坐下后坐稳"与"跌倒后躺平"
+ *   ——两者都是"冲击 + 之后静止"，这是 magnitude-only 判定的公认头号
+ *   误报源（KFall 项目原文 "sitting down heavily sails past it"）。
+ *   开启后，CONFIRMED 判定额外要求：确认时刻重力方向与"竖直参考"
+ *   的夹角 > POSTURE_LYING_ANGLE_DEG（即人处于躺平朝向）。
+ *   竖直参考在 IDLE 持续静止 POSTURE_CALIB_STILL_MS 后自动校准
+ *   （上电时人处于直立/坐直姿态）；未校准时门放行（fail-open），
+ *   行为与门关闭完全一致。
+ *   ⚠️ 前提：佩戴位置/朝向相对固定（胸口/腰部）。手臂佩戴朝向不可靠。
+ *   待成员 B 确定佩戴方案后再置 1。
+ */
+#define POSTURE_CHECK_ENABLE      0
+#define POSTURE_CALIB_STILL_MS    2000u
+
+/* 躺平判据：与竖直参考夹角超过此角度视为躺平。60°。
+ * 实现用 cos² 定点整数比较（见 fall_core.c posture_allows_confirm）：
+ * POSTURE_LYING_COS2_Q4 = cos²(阈值角)·16，60° -> 0.25·16 = 4。
+ * 改角度时两个宏必须同步修改。 */
+#define POSTURE_LYING_ANGLE_DEG   60.0f
+#define POSTURE_LYING_COS2_Q4     4u
+
 /* 帧超时：超过此时间没收到新帧则回到 IDLE（穿戴端掉线保护；
  * 仅对非告警态生效，CONFIRMED 告警锁存不受掉线影响） */
 #define DATA_TIMEOUT_MS        3000u
@@ -136,6 +183,12 @@ typedef struct {
     uint32_t last_mag2;         /* 上一帧合加速度平方（LSB²），供日志 */
     uint32_t last_gyro2;        /* 上一帧角速度平方（LSB²） */
     bool     have_time;         /* last_frame_ms 是否已初始化 */
+#if POSTURE_CHECK_ENABLE
+    /* 姿态门竖直参考（POSTURE_CHECK_ENABLE=1 时使用，默认关闭不占内存） */
+    int16_t  ref_acc[3];        /* 校准时刻的重力向量（人直立/坐直朝向） */
+    uint32_t ref_acc2;          /* 参考向量平方模长（LSB²） */
+    bool     have_ref;          /* 是否已完成竖直参考校准 */
+#endif
 } fall_detector_t;
 
 /* 初始化状态机（上电调用一次） */

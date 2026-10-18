@@ -178,12 +178,68 @@ void fall_detector_init(fall_detector_t *d)
     d->last_mag2       = 0;
     d->last_gyro2      = 0;
     d->have_time       = false;
+#if POSTURE_CHECK_ENABLE
+    d->have_ref        = false;
+#endif
 }
 
 bool fall_detector_alarm_active(const fall_detector_t *d)
 {
     return (d->state == FALL_STATE_CONFIRMED);
 }
+
+#if POSTURE_CHECK_ENABLE
+/*
+ * 姿态门：确认跌倒前检查人是否处于"躺平"朝向（默认关闭，见 fall_core.h）。
+ * 判据：当前重力向量与校准竖直参考的夹角 > 60°（POSTURE_LYING_ANGLE_DEG）。
+ *
+ * 整数实现（fall_core 禁浮点/math.h 的纪律）：
+ *   cosθ = dot / (|a|·|ref|)，夹角 > θ ⟺ dot² < a2·ref2·cos²θ
+ *   按 Q4 定点：dot²·16 < a2·ref2·POSTURE_LYING_COS2_Q4
+ *
+ * 溢出分析（调用前提：acc_near_g 已成立，a2 <= STILL_G_HIGH2 ≈ 7.6e6）：
+ *   |dot| <= |a|·|ref| <= 2763·56756 ≈ 1.57e8 -> dot²·16 ≈ 3.9e17，
+ *   a2·ref2·4 ≈ 1e17，均远小于 uint64 上限 1.8e19，安全。
+ */
+static bool posture_allows_confirm(const fall_detector_t *d, const int16_t acc[3])
+{
+    int64_t  dot;
+    uint32_t a2;
+    uint64_t lhs, rhs;
+
+    /* 未校准 -> 放行（fail-open），行为与门关闭一致 */
+    if (!d->have_ref) {
+        return true;
+    }
+
+    dot = (int64_t)acc[0] * d->ref_acc[0] +
+          (int64_t)acc[1] * d->ref_acc[1] +
+          (int64_t)acc[2] * d->ref_acc[2];
+    a2  = fall_acc_magnitude2(acc);
+
+    if (dot <= 0) {
+        /* 夹角 >= 90°，必大于阈值 -> 躺平成立 */
+        return true;
+    }
+    if (a2 > STILL_G_HIGH2) {
+        /* 理论上不可达（调用方已保证静止带）；防御性放行，
+           同时保证下方乘法的溢出分析前提成立 */
+        return true;
+    }
+
+    lhs = (uint64_t)dot * (uint64_t)dot * 16u;
+    rhs = (uint64_t)a2 * (uint64_t)d->ref_acc2 * POSTURE_LYING_COS2_Q4;
+    return lhs < rhs;   /* 夹角 > 阈值 -> 躺平 -> 允许确认 */
+}
+#else
+/* 门关闭：恒放行（编译器内联后无开销） */
+static bool posture_allows_confirm(const fall_detector_t *d, const int16_t acc[3])
+{
+    (void)d;
+    (void)acc;
+    return true;
+}
+#endif
 
 /*
  * 状态机主体。
@@ -192,9 +248,9 @@ bool fall_detector_alarm_active(const fall_detector_t *d)
  *   IDLE      -> WALK       : 连续运动 MOTION_HOLD_MS        [段 2]
  *   WALK      -> IDLE       : 连续平静 CALM_HOLD_MS          [段 2]
  *   IDLE/WALK -> PENDING    : |a| > IMPACT_THRESH_G          [段 1]
- *   PENDING   -> CONFIRMED  : 窗口内持续静止达 STILL_WINDOW_MS [段 3]
- *   PENDING   -> WALK       : 窗口超时且仍运动               [段 4]
- *   PENDING   -> IDLE       : 窗口超时且已平静               [段 4]
+ *   PENDING   -> CONFIRMED  : 持续静止满 STILL_WINDOW_MS     [段 3]
+ *   PENDING   -> WALK       : PENDING_MAX_MS 到期且仍运动    [段 3]
+ *   PENDING   -> IDLE       : PENDING_MAX_MS 到期且已平静    [段 3]
  *   PENDING   -> PENDING    : 窗口内再次冲击 -> 重开窗口      [段 1]
  *   CONFIRMED -> IDLE       : 持续起身活动 GETUP_HOLD_MS      [段 5]
  *   CONFIRMED -> CONFIRMED  : 人仍躺着，告警保持（无定时解除）[段 5]
@@ -214,6 +270,8 @@ fall_state_t fall_detector_feed(fall_detector_t *d,
     bool acc_near_g  = (mag2 >= STILL_G_LOW2) && (mag2 <= STILL_G_HIGH2);
     bool moving      = (mag2 < WALK_G_LOW2) || (mag2 > WALK_G_HIGH2) ||
                        (gyro2 > WALK_GYRO2);
+    bool still_now;        /* 本帧是否静止（PENDING 确认判据用） */
+    bool pending_expired;  /* 冲击后观察期是否到 PENDING_MAX_MS */
 
     d->last_mag2  = mag2;
     d->last_gyro2 = gyro2;
@@ -274,28 +332,52 @@ fall_state_t fall_detector_feed(fall_detector_t *d,
         return d->state;
     }
 
-    /* --- 段 3：PENDING 静止确认窗口 --- */
+    /*
+     * --- 段 3：PENDING 冲击后确认窗口 ---
+     * 确认判据（2026-10-18 修订，对齐文献 post-fall-inactivity 标准做法）：
+     *   冲击后【持续】静止（gyro_quiet && acc_near_g）累计满 STILL_WINDOW_MS
+     *   即确认；静止被运动打断则计时清零重来。
+     *   旧实现是"快照式"——只在冲击后恰满 STILL_WINDOW_MS 的那一帧检查
+     *   是否静止，存在两条漏报路径（到期帧恰逢抽动 / 静止晚于到期才出现），
+     *   已废弃。
+     * 观察上限：冲击后 PENDING_MAX_MS 内仍未确认 -> 按非跌倒退出。
+     *   防止"碰撞后继续走动、随后才坐下静止"在长观察期内被误确认
+     *   （到期时坐下静止尚不足 STILL_WINDOW_MS）。
+     */
     if (d->state == FALL_STATE_PENDING) {
-        if (gyro_quiet && acc_near_g) {
-            /* 姿态静止：窗口内持续静止即确认 */
-            if (now_ms - d->impact_time_ms >= STILL_WINDOW_MS) {
-                d->state          = FALL_STATE_CONFIRMED;
+        still_now       = gyro_quiet && acc_near_g;
+        pending_expired = (now_ms - d->impact_time_ms >= PENDING_MAX_MS);
+
+        if (still_now) {
+            if (d->calm_start_ms == 0) {
+                d->calm_start_ms = now_ms;
+            }
+            if ((now_ms - d->calm_start_ms >= STILL_WINDOW_MS) &&
+                posture_allows_confirm(d, acc)) {
+                /* 持续静止满窗口 -> 确认跌倒 */
+                d->state           = FALL_STATE_CONFIRMED;
                 d->confirm_time_ms = now_ms;
                 d->calm_start_ms   = 0;
+            } else if (pending_expired) {
+                /* 仍静止但判据未满足（如姿态门拒绝）-> 到上限按非跌倒处理 */
+                d->state           = FALL_STATE_IDLE;
+                d->motion_start_ms = 0;
+                d->calm_start_ms   = now_ms;
             }
-            /* 未到窗口时间则保持 PENDING，继续观察 */
-            return d->state;
-        } else {
-            /* 窗口内仍在运动：看是否已超时 */
-            if (now_ms - d->impact_time_ms >= STILL_WINDOW_MS) {
-                /* 超时未静止 -> 不是跌倒，退回运动/静止 */
-                d->state = moving ? FALL_STATE_WALK : FALL_STATE_IDLE;
-                d->motion_start_ms = moving ? now_ms : 0;
-                d->calm_start_ms   = moving ? 0 : now_ms;
-            }
-            /* 未超时则保持 PENDING（人可能正在爬起/翻滚） */
+            /* 未满窗口则保持 PENDING，继续观察 */
             return d->state;
         }
+
+        /* 静止被打断：静止计时清零 */
+        d->calm_start_ms = 0;
+        if (pending_expired) {
+            /* 到上限仍未静止 -> 不是跌倒，退回运动/静止 */
+            d->state           = moving ? FALL_STATE_WALK : FALL_STATE_IDLE;
+            d->motion_start_ms = moving ? now_ms : 0;
+            d->calm_start_ms   = moving ? 0 : now_ms;
+        }
+        /* 未超时则保持 PENDING（人可能正在爬起/翻滚） */
+        return d->state;
     }
 
     /* --- 段 2 / 段 4：IDLE 与 WALK 之间的运动/平静消抖 --- */
@@ -320,6 +402,22 @@ fall_state_t fall_detector_feed(fall_detector_t *d,
             d->state = FALL_STATE_IDLE;
         }
     }
+
+#if POSTURE_CHECK_ENABLE
+    /* --- 段 6：竖直参考自校准（姿态门用，默认关闭） ---
+     * IDLE 态平静持续满校准时长 -> 把当前重力向量记为"竖直参考"
+     * （此时人处于直立/坐直姿态）。只校准一次；未校准时门放行。
+     * calm_start_ms != 0 隐含本帧平静（moving 分支会清零它）。 */
+    if (!d->have_ref && d->state == FALL_STATE_IDLE &&
+        d->calm_start_ms != 0 &&
+        (now_ms - d->calm_start_ms >= POSTURE_CALIB_STILL_MS)) {
+        d->ref_acc[0] = acc[0];
+        d->ref_acc[1] = acc[1];
+        d->ref_acc[2] = acc[2];
+        d->ref_acc2   = mag2;
+        d->have_ref   = true;
+    }
+#endif
 
     return d->state;
 }

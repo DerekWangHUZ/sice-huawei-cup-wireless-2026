@@ -385,9 +385,6 @@ static void udp_pose_task(void *arg)
 #endif
         }
     }
-
-    close(sock);
-    vTaskDelete(NULL);
 }
 
 /* ==========================================================================

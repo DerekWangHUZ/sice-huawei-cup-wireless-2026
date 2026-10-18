@@ -21,7 +21,7 @@
 
 /* --- 硬件连接（改板子接线时只改这里） --- */
 #define FPGA_UART_PORT      UART_NUM_1
-#define FPGA_UART_TX_GPIO   17        /* S3 的 TX -> FPGA rxd(F13) */
+#define FPGA_UART_TX_GPIO   17        /* S3 的 TX -> FPGA rxd(B15，右扩展排母上排第 1 脚，契约 §4.1；共地) */
 #define FPGA_UART_RX_GPIO   (-1)      /* 本期不接收，不分配 RX 引脚 */
 #define FPGA_UART_BAUDRATE  115200
 
