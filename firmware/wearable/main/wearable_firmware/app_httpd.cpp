@@ -19,6 +19,11 @@
 #include "img_converters.h"
 #include "fb_gfx.h"
 #include "esp32-hal-ledc.h"
+
+// 最近一次UDP触发抓拍的照片由主草图保存。
+// lockLatestPhoto() 成功后，发送结束必须调用 unlockLatestPhoto()。
+bool lockLatestPhoto(const uint8_t **data, size_t *length);
+void unlockLatestPhoto();
 #include "sdkconfig.h"
 #include "camera_index.h"
 #include "board_config.h"
@@ -152,6 +157,30 @@ static size_t jpg_encode_stream(void *arg, size_t index, const void *data, size_
   }
   j->len += len;
   return len;
+}
+
+static esp_err_t latest_photo_handler(httpd_req_t *req) {
+  const uint8_t *photo_data = NULL;
+  size_t photo_length = 0;
+
+  if (!lockLatestPhoto(&photo_data, &photo_length)) {
+    httpd_resp_set_status(req, "404 Not Found");
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_sendstr(req, "No triggered photo yet");
+  }
+
+  httpd_resp_set_type(req, "image/jpeg");
+  httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=fall_capture.jpg");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+  esp_err_t result = httpd_resp_send(
+    req,
+    (const char *)photo_data,
+    photo_length
+  );
+
+  unlockLatestPhoto();
+  return result;
 }
 
 static esp_err_t capture_handler(httpd_req_t *req) {
@@ -728,6 +757,19 @@ void startCameraServer() {
 #endif
   };
 
+  httpd_uri_t pic_uri = {
+    .uri = "/pic",
+    .method = HTTP_GET,
+    .handler = latest_photo_handler,
+    .user_ctx = NULL
+#ifdef CONFIG_HTTPD_WS_SUPPORT
+    ,
+    .is_websocket = true,
+    .handle_ws_control_frames = false,
+    .supported_subprotocol = NULL
+#endif
+  };
+
   httpd_uri_t stream_uri = {
     .uri = "/stream",
     .method = HTTP_GET,
@@ -827,6 +869,7 @@ void startCameraServer() {
     httpd_register_uri_handler(camera_httpd, &cmd_uri);
     httpd_register_uri_handler(camera_httpd, &status_uri);
     httpd_register_uri_handler(camera_httpd, &capture_uri);
+    httpd_register_uri_handler(camera_httpd, &pic_uri);
     httpd_register_uri_handler(camera_httpd, &bmp_uri);
 
     httpd_register_uri_handler(camera_httpd, &xclk_uri);

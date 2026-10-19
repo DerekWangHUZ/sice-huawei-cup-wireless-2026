@@ -5,6 +5,63 @@
 
 ---
 
+## [2026-10-19] 穿戴端固件并入正式工程：异步抓拍 + `/pic` + UDP 8889 命令
+
+### 变更内容
+
+- **穿戴端固件替换为联调版**：`firmware/wearable/main/wearable_firmware/wearable_firmware.ino`
+  并入基站联调分支的实现，新增以下能力（协议 §1.2 / §1.3 零改动）：
+  - UDP `8889` 抓拍命令处理：校验 4 字节 `55 AA 01 FF`，单轮最多 4 包，非法命令丢弃并打印；
+  - 异步抓拍：`capture_worker` 任务（core 0，栈 6144）+ 双信号量，JPEG 存 PSRAM，
+    主循环继续 50 Hz 采样，不因抓拍阻塞；
+  - 非阻塞补光：取图前 150 ms 预热，约 1 s 后自动关灯；
+  - 网络初始化加固：显式 `WiFi.mode(WIFI_STA)`、`WiFi.config()` 失败即停、
+    检查 `udp.begin()` 返回值；
+  - `[STEP ... ms]` 启动日志，用于定位 `setup()` 阻塞点。
+- **网页服务新增 `/pic`**：`app_httpd.cpp` 增加 `latest_photo_handler`，返回最近一次
+  UDP 触发抓拍的照片；未抓拍时 404，断电后丢失。
+- **基站 DHCP 地址池排除 `.2`**：`wifi_init_softap()` 在 `esp_wifi_start()` 后设置
+  `dhcps_lease_t` 为 `192.168.4.10 ~ 192.168.4.100`，避免电脑抢占穿戴端静态地址；
+  设置失败只告警，不影响收包主链路。
+- **文档对齐**：`firmware/wearable/README.md` 更新为联调版内容（抓拍链路、烧录参数、
+  启动日志锚点、9 步验收）；根 README 增加穿戴端能力表与 `/pic` 参数；
+  契约 §1.3 补充抓拍实现要点。
+
+### 文档纠错（与实现对齐）
+
+| 位置 | 原表述 | 实际实现 |
+|---|---|---|
+| `docs/开关按键使用说明书.md` | 人工解除按 KEY1 | **KEY0**（`ui_app.c` 告警态分支） |
+| 同上 | 状态区「接入正常 / 异常 N 项 / 穿戴端未接入 / SD卡未插入」 | 「全部正常 / 设备就绪 / 穿戴端无数据 / 串口断开 / 键盘未连接 / 存储卡未插入」 |
+| 同上 | X-SHIFT 0~6 像素 | **0~4 列**（`settings.c` 钳位） |
+| 根 `README.md` | 设置页 8 项 | **9 项**（`SETTINGS_ITEM_N`） |
+| 契约 §2.2 | 离线自测 14 场景 | **17/17** |
+| 团队分工方案 | UDP「16 字节」 | **18 字节** |
+| 契约 §四 | 标题重复两行、`tl/input_ctrl.v` 代码跨度断裂 | 已修复 |
+| 契约 §4.9 | 「音调相换档」 | 「音调互换档」 |
+| `pins.xdc` 与 RTL/文档 | `sw_mute` 写作 N4/sw[9] | **T7/sw[2]**（XDC 正确，注释与文档已纠正） |
+
+### 验证
+
+- 基站固件 `idf.py build`：**0 error / 0 warning**，`base_station.bin` = 0xe7660 字节，
+  分区余量 10%。
+- 离线自测 `test_harness.exe`：**ALL 17 SCENARIOS PASSED**。
+- 穿戴端：本机无 `arduino-cli`，未做编译验证；代码来源为已在真机跑通的联调版本，
+  本次仅改注释、banner 与一处 TODO。
+
+### 待处理（缺陷，未在本轮修复）
+
+- **摄像头初始化失败会中断后续初始化**：`setup()` 中 `esp_camera_init()` 返回非 `ESP_OK`
+  时直接 `return`，导致 `WiFi.mode` / `WiFi.config` / `WiFi.begin` / `udp.begin` 均不执行，
+  基站侧表现为「穿戴端无数据」。修法：去掉该 `return`，并对 `esp_camera_sensor_get()`
+  返回值加判空（否则 `s->set_framesize` 会 panic）。代码处已加 TODO 标注。
+- 穿戴端上电报 `Camera init failed with error 0x106`（`ESP_ERR_NOT_SUPPORTED`）：
+  SCCB 未读到摄像头型号，排查方向为排线接触、供电、模组本身。
+- 基站 `SO_RCVTIMEO` 在本 IDF 构建下实测不生效，空闲时 `STATS` 不打印；
+  不影响收包主链路，FPGA 侧已有 3s 遥测老化兜底。
+
+---
+
 ## [2026-10-19] 声光交互升级：OLED 多页面 + 键盘可视化设置 + 演示模式 + 数码管"说人话"
 
 > **协议 §4 扩展**：新增 `0x03 SET_AUDIO` 下行命令与 FPGA→S3 上行 UI 帧
