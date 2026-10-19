@@ -5,6 +5,56 @@
 
 ---
 
+## [2026-10-19] 穿戴端联调收尾：抓拍命令端口、帧缓冲与流稳定性
+
+### 现象与定位
+
+穿戴端接入基站后依次暴露以下问题：
+
+1. **Brownout 无限重启**：`setup()` 走到 `WiFi.mode(WIFI_STA)` 时触发
+   `E BOD: Brownout detector was triggered`，随后 `rst:0x3 (SW_RESET)` 循环，
+   永远到不了 `WiFi connected`。射频上电瞬间的电流冲击把供电拉到阈值以下。
+2. **抓拍无响应、`/pic` 一直 404**：基站侧日志有
+   `snap cmd sent to 192.168.4.2:8889`，但穿戴端不闪灯、不存图。
+3. **连续出帧能力不足**：`fb_count = 2` 时 `httpd_resp_send_chunk()` 阻塞发送
+   会占住缓冲，驱动补不上新帧，`esp_camera_fb_get()` 偶发返回 `NULL`。
+
+### 修复
+
+- **Brownout**：关闭检测器。地址为 `RTC_CNTL_BROWN_OUT_REG`，即
+  `DR_REG_RTCCNTL_BASE(0x3ff48000) + 0xd4 = 0x3ff480d4`。检测器在供电临界时
+  会无限复位，反而比"电压真崩时死机"更糟。
+- **抓拍命令端口**：`udp.begin(8889)` 之前先 `udp.stop()`。
+  WiFi 未连上时 `begin()` 会失败且 socket 可能留在半开状态，后续再次 `begin()`
+  依然失败；不清理状态就会导致 `commandPortReady` 永久为 `false`，
+  `checkCaptureCommand()` 直接返回，抓拍从此不再响应。`wifi_keepalive()`
+  重连后的重新绑定同样照此处理。
+- **帧缓冲**：`fb_count` 由 2 提升到 4，分辨率在初始化时直接设为 `QVGA`
+  （避免先按 `UXGA` 分配再降档）；`stream_handler` 对取帧失败做 10 次重试
+  （每次 50 ms），瞬时竞争不再中断已建立的流。
+- **诊断计数**：新增 `g_captureCmdRx / g_captureReject / g_captureOk /
+  g_captureFail`，经 `/status` 暴露，不接串口即可判断抓拍卡在哪一步。
+- **三段自检**：在 `esp_camera_init()`、`setupLedFlash()`、`setupMpu()` 之后
+  各取一帧并打印结果，使「初始化成功但取图失败」与「外设干扰」可从串口区分。
+- **WiFi 健壮性**：启动等待加入 30 秒重试（重试时同步重设静态 IP）；
+  运行期新增 `wifi_keepalive()`，每 3 秒检查、断线 6 秒重连，
+  基站重启后无需人工断电。
+- **I2C 超时**：`MPUWire.setTimeOut(50)`，避免 MPU 掉线时 Wire 阻塞拖死主循环。
+- **摄像头/MPU 失败容错**：任一初始化失败只跳过对应功能，不中断推流主链路。
+
+### 验证
+
+- 姿态推流：基站 `STATS packets=116593 frames_ok=116593`，稳定 50 Hz。
+- 三段自检：`selftest OK: 8518 bytes` / `post-LED selftest OK: 8311 bytes` /
+  `post-MPU selftest OK: 8779 bytes`。
+- 网页：`/` 200（42079 字节）、`/status` 200、`/capture` 200（JPEG）、
+  `/stream` 连续 15 秒不断开。
+- 抓拍链路：跌倒判定 `IDLE -> PENDING -> CONFIRMED` 后下发
+  `snap cmd sent to 192.168.4.2:8889`；`/status` 显示
+  `cmd_port_ready=1 cmd_rx=4 ok=4 fail=0`，`/pic` 返回有效 JPEG。
+
+---
+
 ## [2026-10-19] 穿戴端固件并入正式工程：异步抓拍 + `/pic` + UDP 8889 命令
 
 ### 变更内容
@@ -49,16 +99,35 @@
 - 穿戴端：本机无 `arduino-cli`，未做编译验证；代码来源为已在真机跑通的联调版本，
   本次仅改注释、banner 与一处 TODO。
 
-### 待处理（缺陷，未在本轮修复）
+### 真机联调发现与修复（穿戴端）
 
-- **摄像头初始化失败会中断后续初始化**：`setup()` 中 `esp_camera_init()` 返回非 `ESP_OK`
-  时直接 `return`，导致 `WiFi.mode` / `WiFi.config` / `WiFi.begin` / `udp.begin` 均不执行，
-  基站侧表现为「穿戴端无数据」。修法：去掉该 `return`，并对 `esp_camera_sensor_get()`
-  返回值加判空（否则 `s->set_framesize` 会 panic）。代码处已加 TODO 标注。
-- 穿戴端上电报 `Camera init failed with error 0x106`（`ESP_ERR_NOT_SUPPORTED`）：
-  SCCB 未读到摄像头型号，排查方向为排线接触、供电、模组本身。
-- 基站 `SO_RCVTIMEO` 在本 IDF 构建下实测不生效，空闲时 `STATS` 不打印；
-  不影响收包主链路，FPGA 侧已有 3s 遥测老化兜底。
+上板实测启动日志，定位到以下问题并修复：
+
+1. **Brownout 复位循环**：`setup()` 走到 `WiFi.mode(WIFI_STA)` 时触发
+   `E BOD: Brownout detector was triggered`，随后 `rst:0x3 (SW_RESET)` 无限重启，
+   永远到不了 `WiFi connected`。关闭检测器后不再复位；地址推导见上一条记录。
+
+2. **摄像头失败中断主链路**：`esp_camera_init()` 失败时若直接 `return`，
+   会导致 `WiFi.mode` / `WiFi.config` / `WiFi.begin` / `udp.begin` 全部不执行，
+   基站侧表现为「穿戴端无数据」。现改为失败仅记录、`cameraReady` 保持 false，
+   后续初始化照常进行；`esp_camera_sensor_get()` 的返回值一律判空。
+
+3. **摄像头 `0x106`**：属排线接触问题。断电后重新插紧排线座并锁扣，
+   `esp_camera_init` 即返回 `0x0`，摄像头本身正常。
+
+### 烧录方式
+
+穿戴端烧录需 CAM 插在 MB 板上：该板带有 DTR/RTS 驱动的自动下载电路，
+`esptool --before default-reset` 可直接进入下载模式，无需按键。
+杜邦线接法下 CH340 的 DTR/RTS 只对 EN 有效、IO0 始终为高，
+芯片停在 `boot:0x13`，无法由软件进入下载模式。
+
+### 帧缓冲与烧录速度
+
+- 帧缓冲 `fb_count = 4`、`grab_mode = CAMERA_GRAB_LATEST`，
+  `stream_handler` 对取帧失败做 10 次重试，避免瞬时竞争中断视频流。
+- 烧录参数：`--baud 921600`、单次 `write-flash` 写完 bootloader/分区表/应用，
+  1 MB 应用约 16 秒。
 
 ---
 

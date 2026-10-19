@@ -98,7 +98,7 @@ set_property PULLUP true [get_ports rst_n]
 - ⚠️ **上拉/下拉不一致（官方两处写法不同）**：
   - 电子琴 XDC：`set_property PULLUP true [get_ports {col[3..0]}]`（列线上拉）
   - master 资源文件：`set_property PULLDOWN true [get_ports {col[3..0]}]`（列线下拉）
-  - 实际用哪种取决于板子矩阵接法，尚未实测定论；**建议按键盘扫描惯例“列线输出、行线输入+上拉”对接，并在代码中做消抖**。
+  - 实际用哪种取决于板子矩阵接法，尚无定论；**建议按键盘扫描惯例“列线输出、行线输入+上拉”对接，并在代码中做消抖**。
 
 ---
 
@@ -228,7 +228,7 @@ set_property IOSTANDARD  LVCMOS33 [get_ports buzzer]
 **这些做法不能解决问题**：
 
 - 在 XDC 中设置 `BITSTREAM.CONFIG.PROGPIN/INITPIN/DONEPIN = Pull-up`
-  （想让 FPGA 内部弱上拉替代板上外部上拉）——实测无效。
+  （以 FPGA 内部弱上拉替代板上外部上拉）——无效。
 - `CFGBVS` 与 `CONFIG_VOLTAGE` 属性（该设置用于消除 DRC 的
   `CFGBVS-1` 告警，与上电触发无关）。
 
@@ -237,12 +237,12 @@ set_property IOSTANDARD  LVCMOS33 [get_ports buzzer]
 
 **当前可行的绕过方式**（均需人工或额外硬件）：
 
-1. 上电后按一次 CONFIG 按钮（最简单，已验证有效）。
+1. 上电后按一次 CONFIG 按钮（最简单的方式）。
 2. 用 `program_bit.tcl` 经 JTAG 下载（需要电脑，不满足"脱离电脑"要求）。
 
 **若要实现全自动而又不动配置电路**，可考虑用 ESP32-S3 的一个空闲 GPIO
 接 FPGA 的 `PROGRAM_B`，上电后由 S3 主动拉低 100ms 再释放，等效于按一次
-CONFIG。此方案需增加一根飞线，**当前未采用**。
+CONFIG。此方案需增加一根飞线，**未采用**。
 
 - 烧写失败不会损坏 JTAG 通路：配置 Flash 内容异常时 FPGA 只是不启动，
   仍可用 `program_bit.tcl` 重新下载恢复现场。
@@ -307,4 +307,4 @@ set_property IOSTANDARD LVCMOS33 [get_ports {led[0]}]
 
 ![实验板照片](../hardware/photos/fpga-board.png)
 
-> 官方原理图暂未纳入仓库；取得后可补在 `hardware/schematics/` 并此处引用。
+> 官方原理图不在仓库内；如需引用请置于 `hardware/schematics/`。

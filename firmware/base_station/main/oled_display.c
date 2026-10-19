@@ -174,8 +174,10 @@ static uint8_t s_x_shift  = 2;
 static uint8_t s_draw_w   = OLED_WIDTH - 2;
 static bool    s_full_refresh = false;
 
-/* 状态大字区的临时提示（2s 内显示，调用方负责清除） */
-static char s_hint[12];
+/* 状态大字区的临时提示（2s 内显示，调用方负责清除）。
+ * 容量按最长提示词给足：「人工解除?」= 4 个汉字(12B) + 1 个 ASCII(1B) = 13B，
+ * 取 24B 留余量，避免 snprintf 把末尾汉字截断。 */
+static char s_hint[24];
 
 void oled_set_hint(const char *utf8)
 {
@@ -495,15 +497,30 @@ static void blit16(uint8_t page, uint8_t x, const uint8_t *bits, bool inv)
     }
 }
 
-/* 把 16x16 字模放大 2 倍（32x32，占 4 页）写入帧缓存 */
-static void blit16_2x(uint8_t page, uint8_t x, const uint8_t *bits, bool inv)
+/* 把 16x16 字模放大 2 倍（32x32，占 4 页）写入帧缓存。
+ * clip_w：允许绘制的最大列数（右边缘裁剪）。传 2*CJK16_W 表示不裁剪。
+ * 裁剪的目的是让「4 个汉字 = 128 列」这类超出可用宽度的文本也能全部画出来，
+ * 只损失右边缘少量列，而不是把末尾整字丢弃。 */
+static void blit16_2x_clip(uint8_t page, uint8_t x, const uint8_t *bits,
+                           bool inv, uint8_t clip_w)
 {
     uint8_t h;
     uint8_t c;
     uint8_t r;
+    uint8_t limit;
 
-    if (bits == NULL || (uint16_t)x + 2u * CJK16_W > s_draw_w ||
-        (uint16_t)page + 3u >= OLED_PAGES) {
+    if (bits == NULL || (uint16_t)page + 3u >= OLED_PAGES) {
+        return;
+    }
+    if (x >= s_draw_w) {
+        return;
+    }
+    /* 实际可绘制的列数 = min(clip_w, 剩余宽度) */
+    limit = (uint8_t)(s_draw_w - x);
+    if (clip_w < limit) {
+        limit = clip_w;
+    }
+    if (limit == 0u) {
         return;
     }
 
@@ -526,8 +543,15 @@ static void blit16_2x(uint8_t page, uint8_t x, const uint8_t *bits, bool inv)
 
             /* 横向同样放大 2 倍：相邻两列写同样的字节 */
             for (r = 0; r < 2u; r++) {
-                uint8_t *d0 = &s_fb[page + h * 2u][x + c * 2u + r];
-                uint8_t *d1 = &s_fb[page + h * 2u + 1u][x + c * 2u + r];
+                uint8_t col = (uint8_t)(c * 2u + r);
+                uint8_t *d0;
+                uint8_t *d1;
+
+                if (col >= limit) {
+                    break;                     /* 超出裁剪宽度，停止本字剩余列 */
+                }
+                d0 = &s_fb[page + h * 2u][x + col];
+                d1 = &s_fb[page + h * 2u + 1u][x + col];
                 if (inv) {
                     *d0 &= (uint8_t)~hi;
                     *d1 &= (uint8_t)~lo;
@@ -651,9 +675,25 @@ void oled_draw_big_text(uint8_t page, const char *utf8, bool inv)
         return;
     }
 
-    x = (width >= s_draw_w) ? 0u : (uint8_t)((s_draw_w - width) / 2u);
+    /*
+     * 单字步进：正常为 32 列（16x16 放大 2 倍）。
+     * 当 n 个字排不下（如 4 个汉字需 128 列，而 X-SHIFT 让可用宽度只剩 126）时，
+     * 按可用宽度均分步进，让所有字都画得出来；最后一个字的右边缘会被裁剪
+     * 少量列（通常 2 列），但字形主体完整可辨，不会整字消失。
+     * 步进下限 24 列，再小字会互相压叠、不可辨认。
+     */
+    uint16_t step = (uint16_t)(2u * CJK16_W);
+    if ((uint16_t)(n * step) > s_draw_w) {
+        uint16_t fit = (uint16_t)(s_draw_w / n);
+        if (fit >= 24u) {
+            step = fit;
+        }
+    }
 
-    /* 第二遍：绘制 */
+    uint16_t total = (uint16_t)(n * step);
+    x = (total >= s_draw_w) ? 0u : (uint8_t)((s_draw_w - total) / 2u);
+
+    /* 第二遍：绘制（用裁剪版本，保证末尾字不被整字丢弃） */
     p = utf8;
     while (*p != '\0') {
         uint32_t cp = utf8_decode(&p);
@@ -664,11 +704,11 @@ void oled_draw_big_text(uint8_t page, const char *utf8, bool inv)
         if (bits == NULL) {
             bits = s_cjk_missing;
         }
-        if ((uint16_t)x + 2u * CJK16_W > s_draw_w) {
+        if (x >= s_draw_w) {
             break;
         }
-        blit16_2x(page, x, bits, inv);
-        x = (uint8_t)(x + 2u * CJK16_W);
+        blit16_2x_clip(page, x, bits, inv, (uint8_t)(2u * CJK16_W));
+        x = (uint8_t)(x + step);
     }
 }
 

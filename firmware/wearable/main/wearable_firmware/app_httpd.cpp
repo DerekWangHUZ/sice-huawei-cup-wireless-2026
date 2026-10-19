@@ -20,6 +20,20 @@
 #include "fb_gfx.h"
 #include "esp32-hal-ledc.h"
 
+/*
+ * 抓拍链路诊断计数，定义在 wearable_firmware.ino。
+ * 通过 /status 暴露，便于在不接串口的情况下定位抓拍卡在哪一步：
+ *   cmd_rx=0        -> UDP 8889 命令没收到（网络/绑定问题）
+ *   cmd_rx>0 ok=0   -> 命令收到了但取帧/存图失败（摄像头问题）
+ *   ok>0 而 /pic 404 -> 存储或路由问题
+ */
+extern volatile uint32_t g_captureCmdRx;
+extern volatile uint32_t g_captureReject;
+extern volatile uint32_t g_captureOk;
+extern volatile uint32_t g_captureFail;
+extern bool cameraReady;
+extern bool commandPortReady;
+
 // 最近一次UDP触发抓拍的照片由主草图保存。
 // lockLatestPhoto() 成功后，发送结束必须调用 unlockLatestPhoto()。
 bool lockLatestPhoto(const uint8_t **data, size_t *length);
@@ -101,8 +115,6 @@ void enable_led(bool en) {  // Turn LED On or Off
     duty = CONFIG_LED_MAX_INTENSITY;
   }
   ledcWrite(LED_GPIO_NUM, duty);
-  //ledc_set_duty(CONFIG_LED_LEDC_SPEED_MODE, CONFIG_LED_LEDC_CHANNEL, duty);
-  //ledc_update_duty(CONFIG_LED_LEDC_SPEED_MODE, CONFIG_LED_LEDC_CHANNEL);
   log_i("Set LED intensity to %d", duty);
 }
 #endif
@@ -179,6 +191,7 @@ static esp_err_t latest_photo_handler(httpd_req_t *req) {
     photo_length
   );
 
+  /* 无论发送结果如何都必须解锁，否则互斥量永久占用、后续抓拍全部失败 */
   unlockLatestPhoto();
   return result;
 }
@@ -264,12 +277,32 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   enable_led(true);
 #endif
 
+  /*
+   * 连续取帧失败的容忍次数。
+   *
+   * 单帧 fb_get() 返回 NULL 是正常的瞬时竞争（抓拍任务同时取帧、
+   * 驱动正在换缓冲）。若一失败就 break，浏览器会自动重连，
+   * 每次重连都重新 enable_led(true) -> 闪光灯反复亮灭 = 视觉上的闪烁。
+   * 因此允许连续失败若干次（每次 50ms 后重试），只有持续失败才结束流。
+   */
+  int consecutive_fail = 0;
+  const int kMaxConsecutiveFail = 10;
+
   while (true) {
     fb = esp_camera_fb_get();
     if (!fb) {
-      log_e("Camera capture failed");
-      res = ESP_FAIL;
-    } else {
+      consecutive_fail++;
+      if (consecutive_fail >= kMaxConsecutiveFail) {
+        log_e("Camera capture failed %d times, ending stream", consecutive_fail);
+        res = ESP_FAIL;
+        break;
+      }
+      /* 让出 CPU 给驱动补充缓冲，同时不中断已建立的流 */
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
+    consecutive_fail = 0;
+    {
       _timestamp.tv_sec = fb->timestamp.tv_sec;
       _timestamp.tv_usec = fb->timestamp.tv_usec;
       if (fb->format != PIXFORMAT_JPEG) {
@@ -369,6 +402,7 @@ static esp_err_t cmd_handler(httpd_req_t *req) {
   int val = atoi(value);
   log_i("%s = %d", variable, val);
   sensor_t *s = esp_camera_sensor_get();
+  if (s == NULL) { return httpd_resp_send_500(req); }
   int res = 0;
 
   if (!strcmp(variable, "framesize")) {
@@ -443,14 +477,57 @@ static esp_err_t cmd_handler(httpd_req_t *req) {
   return httpd_resp_send(req, NULL, 0);
 }
 
+/*
+ * 写一条 "0xXXXX":N, 到 json_response。
+ *
+ * 直接写 snprintf(p, end - p, ...) 时，一旦 p 追上或越过 end，
+ * end - p 为 0 或负数，转成 size_t 后变成极大值，会造成缓冲区溢出。
+ * 这里显式钳位可用长度，空间不足时返回 0，调用方 p 不再前进。
+ */
 static int print_reg(char *p, char *end, sensor_t *s, uint16_t reg, uint32_t mask) {
-  return snprintf(p, end - p, "\"0x%04x\":%d,", reg, s->get_reg(s, reg, mask));
+  if (p == NULL || end == NULL || p >= end) {
+    return 0;
+  }
+  size_t avail = (size_t)(end - p);
+  if (avail < 2) {
+    return 0;
+  }
+  int n = snprintf(p, avail - 1, "\"0x%04x\":%d,", reg, s->get_reg(s, reg, mask));
+  if (n < 0) {
+    return 0;
+  }
+  if ((size_t)n >= avail - 1) {
+    return (int)(avail - 1);
+  }
+  return n;
 }
+
+/*
+ * 安全追加：p 已到 end 时不再写入，返回值钳位在可用空间内。
+ * 用于 status_handler 里大量 "p += snprintf(p, end - p, ...)" 的拼接，
+ * 避免 end - p 下溢成极大 size_t 造成越界写。
+ */
+#define JSON_APPEND(...) do { \
+    if (p < end) { \
+      size_t avail_ = (size_t)(end - p); \
+      int n_ = snprintf(p, avail_, __VA_ARGS__); \
+      if (n_ > 0) { \
+        p += ((size_t)n_ < avail_) ? (size_t)n_ : (avail_ - 1); \
+      } \
+    } \
+  } while (0)
 
 static esp_err_t status_handler(httpd_req_t *req) {
   static char json_response[1024];
 
   sensor_t *s = esp_camera_sensor_get();
+  /* 摄像头不可用时返回最小 JSON，避免解引用 NULL 崩溃 */
+  if (s == NULL) {
+    static const char kNoCam[] = "{\"camera\":\"unavailable\"}";
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, kNoCam, strlen(kNoCam));
+  }
   char *p = json_response;
   char *end = json_response + sizeof(json_response);
   *p++ = '{';
@@ -484,38 +561,45 @@ static esp_err_t status_handler(httpd_req_t *req) {
     p += print_reg(p, end, s, 0x132, 0xFF);
   }
 
-  p += snprintf(p, end - p, "\"xclk\":%u,", s->xclk_freq_hz / 1000000);
-  p += snprintf(p, end - p, "\"pixformat\":%u,", s->pixformat);
-  p += snprintf(p, end - p, "\"framesize\":%u,", s->status.framesize);
-  p += snprintf(p, end - p, "\"quality\":%u,", s->status.quality);
-  p += snprintf(p, end - p, "\"brightness\":%d,", s->status.brightness);
-  p += snprintf(p, end - p, "\"contrast\":%d,", s->status.contrast);
-  p += snprintf(p, end - p, "\"saturation\":%d,", s->status.saturation);
-  p += snprintf(p, end - p, "\"sharpness\":%d,", s->status.sharpness);
-  p += snprintf(p, end - p, "\"special_effect\":%u,", s->status.special_effect);
-  p += snprintf(p, end - p, "\"wb_mode\":%u,", s->status.wb_mode);
-  p += snprintf(p, end - p, "\"awb\":%u,", s->status.awb);
-  p += snprintf(p, end - p, "\"awb_gain\":%u,", s->status.awb_gain);
-  p += snprintf(p, end - p, "\"aec\":%u,", s->status.aec);
-  p += snprintf(p, end - p, "\"aec2\":%u,", s->status.aec2);
-  p += snprintf(p, end - p, "\"ae_level\":%d,", s->status.ae_level);
-  p += snprintf(p, end - p, "\"aec_value\":%u,", s->status.aec_value);
-  p += snprintf(p, end - p, "\"agc\":%u,", s->status.agc);
-  p += snprintf(p, end - p, "\"agc_gain\":%u,", s->status.agc_gain);
-  p += snprintf(p, end - p, "\"gainceiling\":%u,", s->status.gainceiling);
-  p += snprintf(p, end - p, "\"bpc\":%u,", s->status.bpc);
-  p += snprintf(p, end - p, "\"wpc\":%u,", s->status.wpc);
-  p += snprintf(p, end - p, "\"raw_gma\":%u,", s->status.raw_gma);
-  p += snprintf(p, end - p, "\"lenc\":%u,", s->status.lenc);
-  p += snprintf(p, end - p, "\"hmirror\":%u,", s->status.hmirror);
-  p += snprintf(p, end - p, "\"vflip\":%u,", s->status.vflip);
-  p += snprintf(p, end - p, "\"dcw\":%u,", s->status.dcw);
-  p += snprintf(p, end - p, "\"colorbar\":%u", s->status.colorbar);
+  JSON_APPEND("\"xclk\":%u,", s->xclk_freq_hz / 1000000);
+  JSON_APPEND("\"pixformat\":%u,", s->pixformat);
+  JSON_APPEND("\"framesize\":%u,", s->status.framesize);
+  JSON_APPEND("\"quality\":%u,", s->status.quality);
+  JSON_APPEND("\"brightness\":%d,", s->status.brightness);
+  JSON_APPEND("\"contrast\":%d,", s->status.contrast);
+  JSON_APPEND("\"saturation\":%d,", s->status.saturation);
+  JSON_APPEND("\"sharpness\":%d,", s->status.sharpness);
+  JSON_APPEND("\"special_effect\":%u,", s->status.special_effect);
+  JSON_APPEND("\"wb_mode\":%u,", s->status.wb_mode);
+  JSON_APPEND("\"awb\":%u,", s->status.awb);
+  JSON_APPEND("\"awb_gain\":%u,", s->status.awb_gain);
+  JSON_APPEND("\"aec\":%u,", s->status.aec);
+  JSON_APPEND("\"aec2\":%u,", s->status.aec2);
+  JSON_APPEND("\"ae_level\":%d,", s->status.ae_level);
+  JSON_APPEND("\"aec_value\":%u,", s->status.aec_value);
+  JSON_APPEND("\"agc\":%u,", s->status.agc);
+  JSON_APPEND("\"agc_gain\":%u,", s->status.agc_gain);
+  JSON_APPEND("\"gainceiling\":%u,", s->status.gainceiling);
+  JSON_APPEND("\"bpc\":%u,", s->status.bpc);
+  JSON_APPEND("\"wpc\":%u,", s->status.wpc);
+  JSON_APPEND("\"raw_gma\":%u,", s->status.raw_gma);
+  JSON_APPEND("\"lenc\":%u,", s->status.lenc);
+  JSON_APPEND("\"hmirror\":%u,", s->status.hmirror);
+  JSON_APPEND("\"vflip\":%u,", s->status.vflip);
+  JSON_APPEND("\"dcw\":%u,", s->status.dcw);
+  JSON_APPEND("\"colorbar\":%u", s->status.colorbar);
 #if defined(LED_GPIO_NUM)
-  p += snprintf(p, end - p, ",\"led_intensity\":%u", led_duty);
+  JSON_APPEND(",\"led_intensity\":%u", led_duty);
 #else
-  p += snprintf(p, end - p, ",\"led_intensity\":%d", -1);
+  JSON_APPEND(",\"led_intensity\":%d", -1);
 #endif
+  /* 抓拍链路诊断（见文件头说明） */
+  JSON_APPEND(",\"camera_ready\":%u", cameraReady ? 1u : 0u);
+  JSON_APPEND(",\"cmd_port_ready\":%u", commandPortReady ? 1u : 0u);
+  JSON_APPEND(",\"capture_cmd_rx\":%u", (unsigned)g_captureCmdRx);
+  JSON_APPEND(",\"capture_reject\":%u", (unsigned)g_captureReject);
+  JSON_APPEND(",\"capture_ok\":%u", (unsigned)g_captureOk);
+  JSON_APPEND(",\"capture_fail\":%u", (unsigned)g_captureFail);
   *p++ = '}';
   *p++ = 0;
   httpd_resp_set_type(req, "application/json");
@@ -541,6 +625,7 @@ static esp_err_t xclk_handler(httpd_req_t *req) {
   log_i("Set XCLK: %d MHz", xclk);
 
   sensor_t *s = esp_camera_sensor_get();
+  if (s == NULL) { return httpd_resp_send_500(req); }
   int res = s->set_xclk(s, LEDC_TIMER_0, xclk);
   if (res) {
     return httpd_resp_send_500(req);
@@ -573,6 +658,7 @@ static esp_err_t reg_handler(httpd_req_t *req) {
   log_i("Set Register: reg: 0x%02x, mask: 0x%02x, value: 0x%02x", reg, mask, val);
 
   sensor_t *s = esp_camera_sensor_get();
+  if (s == NULL) { return httpd_resp_send_500(req); }
   int res = s->set_reg(s, reg, mask, val);
   if (res) {
     return httpd_resp_send_500(req);
@@ -600,6 +686,7 @@ static esp_err_t greg_handler(httpd_req_t *req) {
   int reg = atoi(_reg);
   int mask = atoi(_mask);
   sensor_t *s = esp_camera_sensor_get();
+  if (s == NULL) { return httpd_resp_send_500(req); }
   int res = s->get_reg(s, reg, mask);
   if (res < 0) {
     return httpd_resp_send_500(req);
@@ -639,6 +726,7 @@ static esp_err_t pll_handler(httpd_req_t *req) {
 
   log_i("Set Pll: bypass: %d, mul: %d, sys: %d, root: %d, pre: %d, seld5: %d, pclken: %d, pclk: %d", bypass, mul, sys, root, pre, seld5, pclken, pclk);
   sensor_t *s = esp_camera_sensor_get();
+  if (s == NULL) { return httpd_resp_send_500(req); }
   int res = s->set_pll(s, bypass, mul, sys, root, pre, seld5, pclken, pclk);
   if (res) {
     return httpd_resp_send_500(req);
@@ -674,6 +762,7 @@ static esp_err_t win_handler(httpd_req_t *req) {
     totalX, totalY, outputX, outputY, scale, binning  // codespell:ignore totaly
   );
   sensor_t *s = esp_camera_sensor_get();
+  if (s == NULL) { return httpd_resp_send_500(req); }
   int res = s->set_res_raw(s, startX, startY, endX, endY, offsetX, offsetY, totalX, totalY, outputX, outputY, scale, binning);  // codespell:ignore totaly
   if (res) {
     return httpd_resp_send_500(req);
@@ -687,7 +776,22 @@ static esp_err_t index_handler(httpd_req_t *req) {
   httpd_resp_set_type(req, "text/html");
   httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
   sensor_t *s = esp_camera_sensor_get();
-  if (s != NULL) {
+  /*
+   * 摄像头不可用时（sensor 为 NULL）不要回 500：/pic 抓拍照片与姿态推流
+   * 都不依赖首页，直接给一个最小提示页即可，避免浏览器只看到「内部服务器
+   * 错误」而无法判断设备其实在正常工作。
+   */
+  if (s == NULL) {
+    static const char kNoCam[] =
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<title>CSI Fall Wearable</title></head><body>"
+        "<h2>Camera not available</h2>"
+        "<p>The wearable is running (50 Hz IMU streaming), "
+        "but the camera sensor is not responding.</p>"
+        "</body></html>";
+    return httpd_resp_send(req, kNoCam, strlen(kNoCam));
+  }
+  {
     if (s->id.PID == OV3660_PID) {
       return httpd_resp_send(req, (const char *)index_ov3660_html_gz, index_ov3660_html_gz_len);
     } else if (s->id.PID == OV5640_PID) {
@@ -695,9 +799,6 @@ static esp_err_t index_handler(httpd_req_t *req) {
     } else {
       return httpd_resp_send(req, (const char *)index_ov2640_html_gz, index_ov2640_html_gz_len);
     }
-  } else {
-    log_e("Camera sensor not found");
-    return httpd_resp_send_500(req);
   }
 }
 
@@ -863,13 +964,26 @@ void startCameraServer() {
 
   ra_filter_init(&ra_filter, 20);
 
+  /*
+   * HTTP 任务栈默认 4096 字节偏紧：/stream 与 /capture 会在 handler 内
+   * 做 JPEG 编码与分块发送，栈不够时表现为「请求无响应」或 500。
+   * 这里提到 8192，并打开 LRU 清理，避免浏览器多开标签挤掉连接。
+   */
+  config.stack_size       = 8192;
+  config.max_open_sockets = 7;
+  config.lru_purge_enable = true;
+
   log_i("Starting web server on port: '%u'", config.server_port);
-  if (httpd_start(&camera_httpd, &config) == ESP_OK) {
-    httpd_register_uri_handler(camera_httpd, &index_uri);
+  esp_err_t srv_err = httpd_start(&camera_httpd, &config);
+  if (srv_err == ESP_OK) {
+    esp_err_t r;
+    r = httpd_register_uri_handler(camera_httpd, &index_uri);
+    if (r != ESP_OK) { log_e("register / failed 0x%x", r); }
     httpd_register_uri_handler(camera_httpd, &cmd_uri);
     httpd_register_uri_handler(camera_httpd, &status_uri);
     httpd_register_uri_handler(camera_httpd, &capture_uri);
-    httpd_register_uri_handler(camera_httpd, &pic_uri);
+    r = httpd_register_uri_handler(camera_httpd, &pic_uri);
+    if (r != ESP_OK) { log_e("register /pic failed 0x%x", r); }
     httpd_register_uri_handler(camera_httpd, &bmp_uri);
 
     httpd_register_uri_handler(camera_httpd, &xclk_uri);
@@ -877,6 +991,9 @@ void startCameraServer() {
     httpd_register_uri_handler(camera_httpd, &greg_uri);
     httpd_register_uri_handler(camera_httpd, &pll_uri);
     httpd_register_uri_handler(camera_httpd, &win_uri);
+    log_i("web server started on port %u", config.server_port);
+  } else {
+    log_e("httpd_start(camera) failed: 0x%x", srv_err);
   }
 
   config.server_port += 1;
@@ -886,6 +1003,7 @@ void startCameraServer() {
     httpd_register_uri_handler(stream_httpd, &stream_uri);
   }
 }
+
 
 void setupLedFlash() {
 #if defined(LED_GPIO_NUM)
