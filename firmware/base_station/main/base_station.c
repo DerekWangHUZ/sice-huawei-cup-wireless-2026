@@ -49,6 +49,7 @@
 
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
+#include "dhcpserver/dhcpserver.h"   /* dhcps_lease_t（DHCP 地址池） */
 
 #include "board_pins.h"
 #include "fall_core.h"
@@ -279,6 +280,26 @@ static void wifi_init_softap(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "wifi_start failed: %s", esp_err_to_name(err));
         return;
+    }
+
+    /*
+     * DHCP 地址池避开 192.168.4.2（契约 §1.1 归穿戴端静态地址）。
+     * 否则后接入的电脑可能先拿到 .2，导致抓拍指令发错设备。
+     * 失败只告警：地址池维持默认，不影响收包主链路。
+     */
+    {
+        dhcps_lease_t lease;
+        memset(&lease, 0, sizeof(lease));
+        lease.enable      = true;
+        lease.start_ip.addr = htonl(0xC0A8040A);   /* 192.168.4.10 */
+        lease.end_ip.addr   = htonl(0xC0A80464);   /* 192.168.4.100 */
+        err = esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET,
+                                     ESP_NETIF_REQUESTED_IP_ADDRESS,
+                                     &lease, sizeof(lease));
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "dhcps lease option failed: %s (keep default pool)",
+                     esp_err_to_name(err));
+        }
     }
 
     ESP_LOGI(TAG, "SoftAP started: ssid=%s channel=%d ip=192.168.4.1",

@@ -70,8 +70,7 @@ vivado -mode batch -source program_mcs.tcl
   `data/xicom/cfgmem/bitfile.zip`）。这是 JTAG 间接访问 Flash 的必要前置步骤：
   GUI 会自动做，手写 Tcl 若遗漏会报
   `[Labtools 27-3347] Failure to set flash parameters`（该提示有误导性）。
-- **改完 RTL 必须重新 `gen_mcs.tcl` + `program_mcs.tcl`**，否则 Flash 里仍是旧
-  比特流；只想立刻看现象仍可用 `program_bit.tcl`（那次有效，掉电即失）。
+- **改完 RTL 必须重新 `gen_mcs.tcl` + `program_mcs.tcl`**，否则 Flash 中的比特流与 RTL 不一致；只想立刻看现象仍可用 `program_bit.tcl`（那次有效，掉电即失）。
 - ⚠️ **本板已知问题**：烧写成功（`Erase`/`Program`/`Verify` 全过、读回一致）后，
   断电再上电**仍不会自动启动**，需要**按一次板上 CONFIG 按钮**。
   该现象与比特流、Flash 内容、mcs 格式、烧写方式均无关（按 CONFIG 能正常
@@ -84,8 +83,6 @@ vivado -mode batch -source program_mcs.tcl
 ---
 
 ## 维护须知
-
-以下内容队友不用看。
 
 ### `.xpr` 不入库
 

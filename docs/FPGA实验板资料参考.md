@@ -1,8 +1,8 @@
 # FPGA 实验板资料参考（学校《数字系统实验II》）
 
-> 本文档汇总本人所在学校《数字系统实验 II》课程所用 **Artix-7 实验板** 的完整引脚与片上资源约束，
+> 本文档汇总《数字系统实验 II》课程所用 **Artix-7 实验板** 的完整引脚与片上资源约束，
 > 全部来自《数字系统实验 II》课程各实验的官方 XDC / 源文件，
-> 并结合本人实测交叉校验。后续本仓库 FPGA 工程（`firmware/coprocessor`）的引脚约束以本文为参考。
+> 并经板卡实测交叉校验。本仓库 FPGA 工程（`firmware/coprocessor`）的引脚约束以本文为参考。
 
 ---
 
@@ -33,8 +33,8 @@ set_property IOSTANDARD  LVCMOS33 [get_ports rst_n]
 set_property PULLUP true [get_ports rst_n]
 ```
 
-**实测注意**：本人最初写的 `top.v` 依赖 `rst_n`，结果下载成功（`End of startup status: HIGH`）但 LED 全不亮 —
-原因是 `T9` 没被拉高，设计一直处于异步复位。加上 `PULLUP true` 或改用“不依赖外部复位”的诊断版后即正常。
+**实测注意**：`top.v` 若直接依赖 `rst_n` 而不开内部上拉，下载成功（`End of startup status: HIGH`）但 LED 全不亮 ——
+原因是 `T9` 未被拉高，设计一直处于异步复位。加上 `PULLUP true` 即可正常工作。
 **结论：rst_n 必须开内部上拉，或在逻辑里处理成可选。**
 
 ---
@@ -98,7 +98,7 @@ set_property PULLUP true [get_ports rst_n]
 - ⚠️ **上拉/下拉不一致（官方两处写法不同）**：
   - 电子琴 XDC：`set_property PULLUP true [get_ports {col[3..0]}]`（列线上拉）
   - master 资源文件：`set_property PULLDOWN true [get_ports {col[3..0]}]`（列线下拉）
-  - 实际用哪种取决于板子矩阵接法，本人未实测定论；**建议按键盘扫描惯例“列线输出、行线输入+上拉”对接，并在代码中做消抖**。
+  - 实际用哪种取决于板子矩阵接法，尚未实测定论；**建议按键盘扫描惯例“列线输出、行线输入+上拉”对接，并在代码中做消抖**。
 
 ---
 
@@ -121,7 +121,7 @@ set_property PULLUP true [get_ports rst_n]
 **本项目使用约定**（`pins.xdc` §3b）：
 - `sw[0]`（T9）因与复位冲突**不可用**；`T8/T7/R6` 与本工程实际用到的数码管
   引脚无冲突（本工程不使用 ain 信号），可安全作为拨码输入。
-- 本工程使用 `sw[1]`(T8) = 演示模式总开关、`sw[9]`(N4) = 本地硬静音，
+- 本工程使用 `sw[1]`(T8) = 演示模式总开关、`sw[2]`(T7) = 本地硬静音，
   均开内部 PULLUP；其余 9 位拨码留作扩展，未约束。
 - 极性（拨上=1 还是拨下=1）需上板首验；若相反，在 RTL 取反一处即可。
 
@@ -172,7 +172,7 @@ set_property IOSTANDARD  LVCMOS33 [get_ports buzzer]
 
 ---
 
-## 9. 实测记录（2026-10，本人验证）
+## 9. 板卡实测结论
 
 1. **下载成功标志**：Vivado `Program Device` 日志末尾出现 `End of startup status: HIGH` ⇒ 比特流已配置、DONE 拉高、设计在运行。
 2. **时钟验证法**：把 25 位计数器 `cnt` 的高 16 位直接接 `led`（`assign led = cnt[24:9]`），
@@ -184,7 +184,7 @@ set_property IOSTANDARD  LVCMOS33 [get_ports buzzer]
 
 ## 9b. 配置 Flash 与上电启动（掉电持久化）
 
-> 2026-10-18 补充。`Program Device`（JTAG）写的是 **FPGA 内部 SRAM，掉电即失**；
+`Program Device`（JTAG）写的是 **FPGA 内部 SRAM，掉电即失**；
 > 要让板子自己从 Flash 启动，须把比特流写进板载配置 Flash。
 
 - **器件**：Vivado 硬件管理器自动识别为 Micron **N25Q32-3.3V**（ID：Mfg `20` /
@@ -203,10 +203,10 @@ set_property IOSTANDARD  LVCMOS33 [get_ports buzzer]
   `[Labtools 27-3347] Failure to set flash parameters`，该提示有误导性，
   真实原因见 `readback_hw_cfgmem` 的 `27-3138 indirect programming
   bitstream was not found`）。
-- **改 RTL 后必须重新固化**，否则上电仍跑旧比特流；只想立刻看现象可继续用
+- **改 RTL 后必须重新固化**，否则上电运行的仍是 Flash 中原有比特流；只想立刻看现象可继续用
   JTAG 下载（掉电即失，不影响 Flash 内容）。
 
-### ⚠️ 已知问题：上电不会自动触发配置（当前无法修复）
+### ⚠️ 板级特性：上电不会自动触发配置
 
 **现象**：Flash 烧写成功并通过校验后，断电再上电时板子**不会自动启动**——
 `DONE` 保持为 0，数码管/LED/蜂鸣器全无反应。**手动按一下板上 CONFIG 按钮**，
@@ -225,15 +225,15 @@ set_property IOSTANDARD  LVCMOS33 [get_ports buzzer]
 `PROGRAM_B`（低有效配置复位）；它能手动生效、上电却不生效，指向板级的
 上电复位电路/电源上升沿问题，属**硬件层面**。
 
-**已验证无效**的方案：
+**这些做法不能解决问题**：
 
 - 在 XDC 中设置 `BITSTREAM.CONFIG.PROGPIN/INITPIN/DONEPIN = Pull-up`
   （想让 FPGA 内部弱上拉替代板上外部上拉）——实测无效。
-- `CFGBVS` 与 `CONFIG_VOLTAGE` 属性（该设置保留：它消除了 DRC 的
+- `CFGBVS` 与 `CONFIG_VOLTAGE` 属性（该设置用于消除 DRC 的
   `CFGBVS-1` 告警，与上电触发无关）。
 
 **该板当前行为：上电后必须按一次 CONFIG 才会从 Flash 启动。**
-该现象指向板级上电复位电路/电源上升沿，属**硬件层面**，软件无法规避。
+该现象指向板级上电复位电路/电源上升沿，属**硬件层面**，软件侧无法规避。
 
 **当前可行的绕过方式**（均需人工或额外硬件）：
 
@@ -242,7 +242,7 @@ set_property IOSTANDARD  LVCMOS33 [get_ports buzzer]
 
 **若要实现全自动而又不动配置电路**，可考虑用 ESP32-S3 的一个空闲 GPIO
 接 FPGA 的 `PROGRAM_B`，上电后由 S3 主动拉低 100ms 再释放，等效于按一次
-CONFIG。此方案需增加一根飞线，**本期未实施**。
+CONFIG。此方案需增加一根飞线，**当前未采用**。
 
 - 烧写失败不会损坏 JTAG 通路：配置 Flash 内容异常时 FPGA 只是不启动，
   仍可用 `program_bit.tcl` 重新下载恢复现场。
