@@ -16,12 +16,13 @@
  * 接线全表见 hardware/schematics/基站接线表.md。
  * ==========================================================================
  *
- * 引脚避让（ESP32-S3，改动前务必对照本机开发板丝印）：
+ * 引脚避让（ESP32-S3，接线前务必对照本机开发板丝印）：
  *   GPIO0 / 3 / 45 / 46   strapping 脚，禁用
  *   GPIO26~32             SPI flash / PSRAM，禁用
  *   GPIO19 / 20           USB D-/D+，禁用
  *   GPIO43 / 44           UART0 控制台，禁用
  *   GPIO17                UART1 TX -> FPGA（既有，勿占）
+ *   GPIO18                UART1 RX <- FPGA 上行 UI 帧（fpga_link.h，勿占）
  *
  * I2C 用 GPIO4/5；SPI 用 GPIO10~13，正是 ESP32-S3 SPI2 的 IO_MUX 默认脚
  * （SDSPI_DEFAULT_HOST = SPI2_HOST），走默认脚性能最好。

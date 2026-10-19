@@ -35,6 +35,13 @@
  */
 #include "../../main/log_fmt.c"
 
+/*
+ * FPGA -> S3 上行 UI 帧解析同样直接编入（与 rtl/cmd_decoder.v 逐字段对应）。
+ * 目的：锁定契约 §4.9 上行帧的字段语义（快照位域/键号/滑动重同步），
+ * 与 fall_core/log_fmt 同一纪律。
+ */
+#include "../../main/ui_proto.c"
+
 /* --------------------------------------------------------------------------
  * 期望迁移序列比对
  * -------------------------------------------------------------------------- */
@@ -253,7 +260,7 @@ int main(int argc, char **argv)
     /*
      * 场景 4：冲击后爬起 —— 期望不进 CONFIRMED，回到 WALK
      * 2026-10-18 起 PENDING 由 PENDING_MAX_MS(4s) 观察上限兜底退出
-     * （旧的 1.5s 快照窗口已废弃），故本场景数据延长到 4s 之后。
+     * （确认判据为持续静止计时），故本场景数据延长到 4s 之后。
      */
     {
         fall_state_t exp[] = { FALL_STATE_IDLE, FALL_STATE_WALK,
@@ -297,7 +304,7 @@ int main(int argc, char **argv)
      *   喂 fall_lying 到 CONFIRMED 后停止发帧，tick 推进 12 秒：
      *   人躺在地上昏迷 + 数据停摆 = 最需要报警的时刻，告警必须保持。
      *   （历史缺陷：曾实现"停摆 3s 掉线解除"和"10s 定时解除"，
-     *    人还在地上报警器却停了——均为错误语义，已废弃。）
+     *    人还在地上报警器却停了——均为错误语义。）
      *   解除唯一途径：持续起身活动（场景 8 验证）。
      */
     {
@@ -581,6 +588,188 @@ int main(int argc, char **argv)
         if (ok) {
             printf("  [PASS] %d conversion case(s) exact, sentinel unambiguous\n",
                    ncase);
+        } else {
+            failures++;
+        }
+        ran++;
+        printf("\n");
+    }
+
+    /*
+     * 场景 16：FPGA->S3 上行 UI 帧解析（契约 §4.9）
+     *
+     * 锁定四件事：
+     *   a) 合法快照帧（演示模式=1、静音=0、场景=4）逐字段解出；
+     *   b) 合法键事件帧（键号 11 = 丝印 'C'）解出；
+     *   c) 垃圾字节流后紧跟合法帧 -> 滑动重同步必然解出；
+     *   d) 校验失败报 BAD、未知命令码静默丢弃（与 rtl/cmd_decoder 容错语义一致）。
+     */
+    {
+        uint8_t snap[8], keyf[8];
+        uint8_t garbage[3] = { 0x12, 0xAA, 0x99 };
+        ui_frame_t f;
+        ui_proto_result_t r;
+        int i, ok = 1;
+
+        snap[0] = 0xAA; snap[1] = 0x55; snap[2] = 0x80; snap[3] = 0x01;
+        snap[4] = 0x11;                     /* p2lo: bit0=1(demo) [4:2]=100(场景4) */
+        snap[5] = 0x00;                     /* p2hi */
+        snap[6] = (uint8_t)(0x80 ^ 0x01 ^ 0x11 ^ 0x00);
+        snap[7] = 0x0D;
+
+        keyf[0] = 0xAA; keyf[1] = 0x55; keyf[2] = 0x81; keyf[3] = 0x01;
+        keyf[4] = 0x0B;                     /* p2lo: 键号 11（'C'） */
+        keyf[5] = 0x00;
+        keyf[6] = (uint8_t)(0x81 ^ 0x01 ^ 0x0B ^ 0x00);
+        keyf[7] = 0x0D;
+
+        printf("[16] ui_proto uplink frame parsing\n");
+
+        ui_proto_reset();
+        r = UI_PROTO_WAIT;
+        for (i = 0; i < 8; i++) {
+            r = ui_proto_feed(snap[i], &f);
+        }
+        printf("  snapshot frame -> r=%d cmd=0x%02X demo=%u mute=%u scene=%u\n",
+               (int)r, (unsigned)f.cmd, (unsigned)UI_SNAP_DEMO(f.p2),
+               (unsigned)UI_SNAP_MUTE(f.p2), (unsigned)UI_SNAP_SCENE(f.p2));
+        if (r != UI_PROTO_OK || f.cmd != 0x80 ||
+            UI_SNAP_DEMO(f.p2) != 1u || UI_SNAP_MUTE(f.p2) != 0u ||
+            UI_SNAP_SCENE(f.p2) != 4u) {
+            printf("  ASSERT FAILED: snapshot fields\n");
+            ok = 0;
+        }
+
+        ui_proto_reset();
+        r = UI_PROTO_WAIT;
+        for (i = 0; i < 8; i++) {
+            r = ui_proto_feed(keyf[i], &f);
+        }
+        printf("  key frame      -> r=%d cmd=0x%02X key=%u\n",
+               (int)r, (unsigned)f.cmd, (unsigned)UI_KEY_CODE(f.p2));
+        if (r != UI_PROTO_OK || f.cmd != 0x81 || UI_KEY_CODE(f.p2) != 11u) {
+            printf("  ASSERT FAILED: key frame fields\n");
+            ok = 0;
+        }
+
+        /* 垃圾 + 合法帧：滑动重同步 */
+        ui_proto_reset();
+        r = UI_PROTO_WAIT;
+        for (i = 0; i < 3; i++) {
+            r = ui_proto_feed(garbage[i], &f);
+        }
+        for (i = 0; i < 8; i++) {
+            r = ui_proto_feed(keyf[i], &f);
+        }
+        if (r != UI_PROTO_OK || f.cmd != 0x81 || UI_KEY_CODE(f.p2) != 11u) {
+            printf("  ASSERT FAILED: resync after garbage\n");
+            ok = 0;
+        } else {
+            printf("  resync after garbage -> OK\n");
+        }
+
+        /* 坏校验：报 BAD 且不产生帧 */
+        ui_proto_reset();
+        keyf[6] ^= 0x5A;
+        r = UI_PROTO_WAIT;
+        for (i = 0; i < 8; i++) {
+            r = ui_proto_feed(keyf[i], &f);
+        }
+        keyf[6] ^= 0x5A;                     /* 还原，供后续未知命令测试 */
+        printf("  bad xor        -> r=%d (expect %d)\n", (int)r,
+               (int)UI_PROTO_BAD);
+        if (r != UI_PROTO_BAD) {
+            printf("  ASSERT FAILED: bad checksum not reported\n");
+            ok = 0;
+        }
+
+        /* 未知命令码（校验正确）：静默丢弃，不报帧 */
+        ui_proto_reset();
+        r = UI_PROTO_WAIT;
+        for (i = 0; i < 8; i++) {
+            uint8_t b = keyf[i];
+            if (i == 2) b = 0x77;
+            if (i == 6) b = (uint8_t)(0x77 ^ keyf[3] ^ keyf[4] ^ keyf[5]);
+            r = ui_proto_feed(b, &f);
+        }
+        printf("  unknown cmd    -> r=%d (expect %d = WAIT)\n", (int)r,
+               (int)UI_PROTO_WAIT);
+        if (r != UI_PROTO_WAIT) {
+            printf("  ASSERT FAILED: unknown cmd must be dropped silently\n");
+            ok = 0;
+        }
+
+        if (ok) {
+            printf("  [PASS] ui_proto snap/key/resync/bad/unknown\n");
+        } else {
+            failures++;
+        }
+        ran++;
+        printf("\n");
+    }
+
+    /*
+     * 场景 17：人工解除告警 fall_detector_force_clear()
+     *
+     * 安全边界：
+     *   a) CONFIRMED 时可解除 -> 返回 true，状态回 IDLE；
+     *   b) 非告警态（IDLE/WALK/PENDING）调用返回 false 且状态不变；
+     *   c) 清除后计时字段归零，后续帧仍能正常判定（不残留脏状态）。
+     */
+    {
+        fall_detector_t d;
+        int ok = 1;
+
+        printf("[17] manual clear fall_detector_force_clear\n");
+
+        /* 直接构造 CONFIRMED 状态 */
+        fall_detector_init(&d);
+        d.state           = FALL_STATE_CONFIRMED;
+        d.impact_time_ms  = 1000u;
+        d.motion_start_ms = 800u;
+        d.calm_start_ms   = 1200u;
+        d.confirm_time_ms = 1500u;
+
+        if (!fall_detector_force_clear(&d)) {
+            printf("  ASSERT FAILED: CONFIRMED force_clear returned false\n");
+            ok = 0;
+        }
+        printf("  CONFIRMED -> %s (expect IDLE)\n", fall_state_name(d.state));
+        if (d.state != FALL_STATE_IDLE) {
+            printf("  ASSERT FAILED: state not cleared\n");
+            ok = 0;
+        }
+        if (d.impact_time_ms != 0u || d.motion_start_ms != 0u ||
+            d.calm_start_ms != 0u || d.confirm_time_ms != 0u) {
+            printf("  ASSERT FAILED: timing fields not reset\n");
+            ok = 0;
+        }
+
+        /* 非告警态：必须拒绝且状态不变 */
+        {
+            fall_state_t cases[] = { FALL_STATE_IDLE, FALL_STATE_WALK,
+                                     FALL_STATE_PENDING };
+            int k;
+            for (k = 0; k < 3; k++) {
+                fall_detector_t e;
+                fall_detector_init(&e);
+                e.state = cases[k];
+                if (fall_detector_force_clear(&e)) {
+                    printf("  ASSERT FAILED: force_clear accepted %s\n",
+                           fall_state_name(cases[k]));
+                    ok = 0;
+                }
+                if (e.state != cases[k]) {
+                    printf("  ASSERT FAILED: %s mutated\n",
+                           fall_state_name(cases[k]));
+                    ok = 0;
+                }
+            }
+            printf("  non-alarm states rejected without mutation\n");
+        }
+
+        if (ok) {
+            printf("  [PASS] manual clear bounds ok\n");
         } else {
             failures++;
         }

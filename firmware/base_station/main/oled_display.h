@@ -50,6 +50,21 @@ typedef struct {
     uint32_t sd_dropped;        /* SD 队列丢弃条数 */
     char     sd_file[24];       /* SD 文件名（如 DATA_001.CSV），未挂载填 "-" */
     bool     fpga_ok;           /* FPGA UART 链路是否就绪 */
+
+    /* ---- 多页面扩展字段（ui 任务填充） ---- */
+    uint16_t mag_x100;          /* 最近合加速度幅值（0.01g） */
+    int16_t  acc[3];            /* 最近三轴原始值（显示用，超时路径保持旧值） */
+    int16_t  gyro[3];           /* 最近三轴角速度原始值 */
+    uint8_t  has_impact;        /* 告警时已捕获冲击幅值 */
+    uint16_t impact_mag_x100;   /* 冲击时刻幅值（告警屏定格显示） */
+    uint8_t  fps_x10;           /* 实测帧率 x10（包数差分） */
+    uint8_t  ui_alive;          /* FPGA 上行 UI 链路心跳 */
+
+    /* ---- 复审增补：数据新鲜度 / 告警计时 / 有效静音 ---- */
+    uint32_t last_frame_ms;     /* 最近一帧到达时刻（esp_timer ms，0=从未） */
+    uint8_t  data_fresh;        /* 可穿戴数据流存活（< DATA_TIMEOUT_MS） */
+    uint32_t alarm_start_ms;    /* 进入真实告警的时刻（0 = 不在告警） */
+    uint8_t  mute_effective;    /* 有效静音（FPGA 上报拨码位 | 设置项） */
 } oled_status_t;
 
 /*
@@ -94,5 +109,50 @@ esp_err_t oled_flush(void);
 
 /* 渲染并刷新一屏状态（= clear + 标题/大字/遥测行 + flush） */
 esp_err_t oled_show_status(const oled_status_t *s);
+
+/*
+ * 状态大字区的临时提示（如「解除」，2s 由调用方清除；NULL/空串清除）。
+ * 提示显示期间大字区以 16x16 单倍字号居中替代状态词。
+ */
+void oled_set_hint(const char *utf8);
+
+/*
+ * 面板边缘不可见补偿（实测本屏左右各约 2 列像素被外框遮挡）。
+ *
+ * 帧缓存以"安全区"为坐标系绘制：安全区宽 = OLED_SAFE_W，绘制内容整体
+ * 右移 OLED_X_SHIFT 列后进帧缓存，因此内容永远不会落在被遮挡的边缘列上。
+ *
+ *   shift = 0 : 关闭补偿（内容铺满 128 列，边缘会被遮挡）
+ *   shift = 1..4 : 左右各留 shift 列不可用，内容区平移
+ *
+ * 运行期可调（设置项 X-SHIFT），掉电由 NVS 保存。
+ */
+void oled_set_x_shift(uint8_t shift);
+
+/* 下一帧强制整屏重刷（用于布局/偏移切换，清掉页面上残留的旧像素） */
+void oled_force_full_refresh(void);
+
+/* ---- 多页面扩展 ---- */
+
+/* 运行期设置面板对比度（0x81 命令）；面板未就绪时返回错误且无副作用 */
+esp_err_t oled_set_contrast(uint8_t val);
+
+/*
+ * P1 遥测页：幅值 + 三轴 + 帧率/坏帧 + 幅值历史条形图。
+ * mag_hist 为 ui 任务维护的 0..15 级历史环形缓冲（时间序，末元素最右柱）。
+ */
+void oled_show_telemetry(const oled_status_t *s,
+                         const uint8_t *mag_hist, uint8_t hist_n);
+
+/* P2 系统页：网络/运行时长/存储/链路/判定参数一览 */
+void oled_show_system(const oled_status_t *s, const char *ssid, int channel);
+
+/* P3 设置页：光标高亮 + 当前值（内容取自 settings 模块） */
+void oled_show_settings(uint8_t cursor);
+
+/* P4 演示页：场景名 + 预期声光表现 + 剧本进度；demo_active=false 时
+ * 显示待机指引（拨码 sw[1] 开启），不渲染场景内容。 */
+void oled_show_demo(uint8_t scene, int script_step, const char *script_name,
+                    bool demo_mute, bool demo_active);
 
 #endif /* OLED_DISPLAY_H */

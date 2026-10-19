@@ -54,6 +54,8 @@
 #include "fall_core.h"
 #include "csi_stub.h"
 #include "fpga_link.h"
+#include "settings.h"
+#include "ui_app.h"
 #if ENABLE_OLED
 #include "oled_display.h"
 #endif
@@ -63,11 +65,14 @@
 
 static const char *TAG = "BASE";
 
-/* --- 网络参数（契约 §1.1 / README） --- */
+/* --- 网络参数（契约 §1.1 / README）；系统页显示经 k_ap_* 同源导出 --- */
 #define AP_SSID          "CSI_FALL_AP"
 #define AP_PASSWORD      "12345678"
 #define AP_CHANNEL       6
 #define AP_MAX_CONN      4
+
+const char *const k_ap_ssid    = AP_SSID;
+const int        k_ap_channel = AP_CHANNEL;
 
 #define UDP_PORT_POSE    8888      /* 收穿戴端姿态推流 */
 #define UDP_PORT_SNAP    8889      /* 发抓拍指令给穿戴端 */
@@ -79,11 +84,9 @@ static const uint8_t SNAP_CMD[4] = { 0x55, 0xAA, 0x01, 0xFF };
 /* 统计打印周期 */
 #define STATS_PERIOD_MS  5000u
 
-/* FPGA 数码管遥测刷新周期（契约 §4.5）。
- * 状态帧按"变化沿"发送，但数码管读数需要持续刷新才能反映实时运动；
- * 这里以 1Hz 重发 SET_STATE（p1=当前状态码，p2=合加速度幅值）。
- * 对 FPGA 完全幂等：cmd_decoder 只做锁存，不产生任何动作。 */
-#define FPGA_TEL_PERIOD_MS  1000u
+/* 数码管遥测刷新周期：由设置模块管理（settings.c 的 g_fpga_tel_period_ms，
+ * 默认 1s，设置页 P3 可调 0.5/1/2s）。周期重发 SET_STATE 对 FPGA 完全
+ * 幂等：cmd_decoder 只做锁存，不产生任何动作（契约 §4.5）。 */
 
 /* --- 全局统计（原始日志用） --- */
 static uint32_t g_frames_ok   = 0;
@@ -93,13 +96,47 @@ static uint32_t g_packets     = 0;
 /* FPGA 链路是否就绪（app_main 初始化后不再变化） */
 static bool g_fpga_ok = false;
 
+/* 最近一次遥测（UI 快照显示用；写入者=udp_pose_task，读取者=快照发布） */
+#if ENABLE_OLED
+static uint16_t g_last_mag_x100 = 0;
+static int16_t  g_last_acc[3]  = { 0, 0, 0 };
+static int16_t  g_last_gyro[3] = { 0, 0, 0 };
+static uint32_t g_last_frame_ms = 0;    /* 最近一帧到达时刻（UI 新鲜度判据） */
+static uint32_t g_alarm_start_ms = 0;   /* 进入真实告警的时刻（0=不在告警） */
+#endif
+
+/* 告警冲击幅值（进入 CONFIRMED 时捕获，告警屏定格显示；解除即清） */
+static uint16_t g_impact_mag = 0;
+static bool     g_has_impact = false;
+
+/* 人工解除告警请求（UI 任务置位；udp_pose_task 执行并清除） */
+volatile bool g_manual_clear_req = false;
+
 /* ==========================================================================
- * 状态快照（供 OLED 任务读取）
+ * 人工解除告警：在主判定任务里执行（保持单一写入者纪律）。
+ * 返回 true 表示本次执行了解除（调用方随后照常走状态变化沿下发 CLEAR）。
+ * ========================================================================== */
+static bool manual_clear_poll(fall_detector_t *det)
+{
+    if (!g_manual_clear_req) {
+        return false;
+    }
+    g_manual_clear_req = false;
+    if (fall_detector_force_clear(det)) {
+        ESP_LOGW(TAG, "MANUAL CLEAR: alarm released by operator");
+        return true;
+    }
+    return false;
+}
+
+/* ==========================================================================
+ * 状态快照（供 UI 任务读取）
  *
  * 单一写入者：udp_pose_task（唯一接触 fall_detector 的任务）。
- * 读取者：oled_task。用互斥量保护结构体整体拷贝，避免读到半更新状态。
+ * 读取者：ui 任务（经 base_station_get_status 访问器）。用互斥量保护
+ * 结构体整体拷贝，避免读到半更新状态。
  * 注意：快照只用于显示，判定逻辑始终只依赖 udp_pose_task 内的 det，
- *       因此即使 OLED 任务异常也不会影响判定结果。
+ *       因此即使 UI 任务异常也不会影响判定结果。
  * ========================================================================== */
 #if ENABLE_OLED
 static oled_status_t    g_status;
@@ -118,9 +155,72 @@ static void status_publish(const fall_detector_t *det, uint16_t seq)
     g_status.frames_ok  = g_frames_ok;
     g_status.frames_bad = g_frames_bad;
     g_status.csi_var    = csi_get_variance();
+    g_status.mag_x100   = g_last_mag_x100;
+    g_status.acc[0]     = g_last_acc[0];
+    g_status.acc[1]     = g_last_acc[1];
+    g_status.acc[2]     = g_last_acc[2];
+    g_status.gyro[0]    = g_last_gyro[0];
+    g_status.gyro[1]    = g_last_gyro[1];
+    g_status.gyro[2]    = g_last_gyro[2];
+    g_status.has_impact = g_has_impact;
+    g_status.impact_mag_x100 = g_impact_mag;
+    g_status.last_frame_ms = g_last_frame_ms;
+    g_status.alarm_start_ms = g_alarm_start_ms;
+    xSemaphoreGive(g_status_mtx);
+}
+
+void base_station_get_status(oled_status_t *out)
+{
+    if (out == NULL) {
+        return;
+    }
+    if (g_status_mtx == NULL) {
+        memset(out, 0, sizeof(*out));
+        return;
+    }
+    xSemaphoreTake(g_status_mtx, portMAX_DELAY);
+    *out = g_status;
     xSemaphoreGive(g_status_mtx);
 }
 #endif /* ENABLE_OLED */
+
+bool base_station_fpga_ok(void)
+{
+    return g_fpga_ok;
+}
+
+/* 真实判定状态（演示剧本退出时向 FPGA 重同步用） */
+fall_state_t base_station_real_state(void)
+{
+#if ENABLE_OLED
+    fall_state_t st;
+    if (g_status_mtx == NULL) {
+        return FALL_STATE_IDLE;
+    }
+    xSemaphoreTake(g_status_mtx, portMAX_DELAY);
+    st = g_status.state;
+    xSemaphoreGive(g_status_mtx);
+    return st;
+#else
+    return FALL_STATE_IDLE;
+#endif
+}
+
+bool base_station_alarm_active(void)
+{
+#if ENABLE_OLED
+    bool ret;
+    if (g_status_mtx == NULL) {
+        return false;
+    }
+    xSemaphoreTake(g_status_mtx, portMAX_DELAY);
+    ret = g_status.alarm;
+    xSemaphoreGive(g_status_mtx);
+    return ret;
+#else
+    return false;
+#endif
+}
 
 /* ==========================================================================
  * SoftAP 初始化
@@ -230,16 +330,30 @@ static void handle_state_change(int sock,
              (unsigned)now_ms);
 
     if (st == FALL_STATE_CONFIRMED) {
-        /* 确认跌倒：告警 + 抓拍。
-         * 契约 §4.5 第 2 条：确认跌倒后只发 ALARM，绝不发 SET_STATE(3)；
-         * 后续的周期遥测也会在 CONFIRMED 期间自动停发，使数码管读数
-         * 冻结在冲击那一刻的幅值上。 */
+        /* 确认跌倒：告警 + 抓拍。ALARM/CLEAR 永不因演示模式被抑制
+         * （真实告警必须直通 FPGA，安全优先）。
+         * 契约 §4.5 第 2 条：确认跌倒后只发 ALARM，绝不发 SET_STATE(3)。 */
+        g_impact_mag = mag_x100;          /* 冲击幅值定格（告警屏显示） */
+        g_has_impact = true;
+#if ENABLE_OLED
+        g_alarm_start_ms = now_ms;        /* 告警计时起点（OLED T+NNs） */
+#endif
         fpga_link_send_alarm();
         send_snapshot_cmd(sock);
     } else if (*last_state == FALL_STATE_CONFIRMED) {
         /* 离开告警态：解除 */
+        g_has_impact = false;
+#if ENABLE_OLED
+        g_alarm_start_ms = 0;
+#endif
         fpga_link_send_clear();
     } else {
+        /* 演示剧本运行期间抑制真实状态同步帧（遥测同步停发由
+         * fpga_telemetry_tick 同规则处理）；ALARM/CLEAR 不受影响。 */
+        if (g_ui_demo_owns_state) {
+            *last_state = st;
+            return;
+        }
         /* 其它迁移：同步状态显示（携带当前幅值，避免读数滞后一次刷新）。
          * 注意用 verbose 版本：状态变化沿是验收信号，日志里必须有
          * `TX cmd=0x10 p1=...`（见 docs/成员A任务状态.md 的"状态同步"行）；
@@ -250,15 +364,14 @@ static void handle_state_change(int sock,
 }
 
 /* ==========================================================================
- * 周期遥测刷新（契约 §4.5）：1Hz 重发 SET_STATE 携带合加速度幅值，
- * 让数码管读数持续反映实时运动。
+ * 周期遥测刷新（契约 §4.5）：周期重发 SET_STATE 携带合加速度幅值，
+ * 让数码管读数持续反映实时运动。周期由设置页 P3 调节（0.5/1/2s）。
  *
- * 三条约束：
- *   1) CONFIRMED 期间不发 —— 保持"确认跌倒后只发 ALARM"的既有语义，
- *      同时让告警画面上的读数定格为冲击幅值；
- *   2) 无有效帧（data timeout 分支）时发 0xFFFF 哨兵，让 FPGA 显示 "----"
- *      而不是把上一次的读数伪装成当前值；
- *   3) FPGA 链路未就绪时直接跳过。
+ * 约束：
+ *   1) 演示剧本运行期间停发 —— 显示归剧本所有（ALARM/CLEAR 不受影响）；
+ *   2) CONFIRMED 期间不发 —— 保持"确认跌倒后只发 ALARM"的既有语义；
+ *   3) 无有效帧（data timeout 分支）时发 0xFFFF 哨兵；
+ *   4) FPGA 链路未就绪时直接跳过。
  * ========================================================================== */
 static void fpga_telemetry_tick(const fall_detector_t *det,
                                 uint16_t mag_x100,
@@ -269,11 +382,16 @@ static void fpga_telemetry_tick(const fall_detector_t *det,
     if (!g_fpga_ok || det->state == FALL_STATE_CONFIRMED) {
         return;
     }
+    if (g_ui_demo_owns_state) {
+        /* 演示剧本拥有显示：真实遥测停发，防止覆盖剧本画面 */
+        *last_tel_ms = now_ms;
+        return;
+    }
     if (*last_tel_ms == 0) {
         *last_tel_ms = now_ms;
         return;
     }
-    if (now_ms - *last_tel_ms < FPGA_TEL_PERIOD_MS) {
+    if (now_ms - *last_tel_ms < g_fpga_tel_period_ms) {
         return;
     }
     *last_tel_ms = now_ms;
@@ -355,6 +473,11 @@ static void udp_pose_task(void *arg)
              * 超时/无数据：也要推进告警超时与掉线保护（每 100ms 一次）。
              * 状态机解除 -> 照常走状态变化沿下发 CLEAR/SET_STATE。
              */
+            /* 人工解除请求优先于 tick（操作者显式命令） */
+            if (manual_clear_poll(&det)) {
+                handle_state_change(sock, &det, &last_state, det.state, 0,
+                                    FPGA_TEL_NO_DATA, now_ms);
+            }
             fall_state_t st = fall_detector_tick(&det, now_ms);
             handle_state_change(sock, &det, &last_state, st, 0,
                                 FPGA_TEL_NO_DATA, now_ms);
@@ -381,18 +504,37 @@ static void udp_pose_task(void *arg)
             }
 
             g_frames_ok++;
+#if ENABLE_OLED
+            g_last_frame_ms = now_ms;    /* 数据流存活判据（UI P1/P2 LINK） */
+#endif
 
             /* 合加速度幅值（0.01g）——遥测用，纯整数换算，无浮点 */
             last_mag_x100 = fall_acc_mag_centi_g(frame.acc);
+#if ENABLE_OLED
+            g_last_mag_x100 = last_mag_x100;
+            g_last_acc[0] = frame.acc[0];
+            g_last_acc[1] = frame.acc[1];
+            g_last_acc[2] = frame.acc[2];
+            g_last_gyro[0] = frame.gyro[0];
+            g_last_gyro[1] = frame.gyro[1];
+            g_last_gyro[2] = frame.gyro[2];
+#endif
 
             /* CSI 占位：真实实现在此更新统计量 */
             csi_feed_packet();
 
-            /* 跌倒判定 */
+            /* 跌倒判定（先处理人工解除请求，保证按键即刻生效） */
+            (void)manual_clear_poll(&det);
             fall_state_t st = fall_detector_feed(&det,
                                                  frame.acc,
                                                  frame.gyro,
                                                  now_ms);
+
+            /* 人工解除后状态已变，走状态变化沿下发 CLEAR */
+            if (st != last_state && st == FALL_STATE_IDLE &&
+                last_state == FALL_STATE_CONFIRMED) {
+                ESP_LOGW(TAG, "MANUAL CLEAR applied (state edge)");
+            }
 
             /* 状态变化沿 -> 下发控制帧（契约 §4.5） */
             handle_state_change(sock, &det, &last_state, st, frame.seq,
@@ -460,47 +602,8 @@ static void udp_pose_task(void *arg)
     }
 }
 
-/* ==========================================================================
- * OLED 显示任务
- *
- * 独立低优先级任务：I2C 整屏刷新（8 页 x 128B @400kHz 约 25ms）不能放在
- * 收包任务里，否则同样会打乱 100ms 收包节拍。此处只读快照，不碰判定状态。
- * ========================================================================== */
-#if ENABLE_OLED
-static void oled_task(void *arg)
-{
-    (void)arg;
-
-    while (1) {
-        oled_status_t snap;
-
-        if (g_status_mtx != NULL) {
-            xSemaphoreTake(g_status_mtx, portMAX_DELAY);
-            snap = g_status;
-            xSemaphoreGive(g_status_mtx);
-        } else {
-            memset(&snap, 0, sizeof(snap));
-        }
-
-        /* 这几个量不属于判定状态，直接取（写者仅在初始化期写文件名） */
-        snap.fpga_ok    = g_fpga_ok;
-#if ENABLE_SD_LOG
-        snap.sd_ok      = sd_log_ready();
-        snap.sd_dropped = sd_log_dropped();
-        snprintf(snap.sd_file, sizeof(snap.sd_file), "%s", sd_log_filename());
-#else
-        snap.sd_ok      = false;
-        snap.sd_dropped = 0;
-        snprintf(snap.sd_file, sizeof(snap.sd_file), "%s", "-");
-#endif
-
-        /* 失败已在驱动内计数限流，这里不重复刷屏 */
-        (void)oled_show_status(&snap);
-
-        vTaskDelay(pdMS_TO_TICKS(OLED_REFRESH_PERIOD_MS));
-    }
-}
-#endif /* ENABLE_OLED */
+/* OLED 单页状态渲染任务已由 ui_app.c 的 ui 任务取代（多页面 + 键盘导航 +
+ * 演示剧本）；快照填充逻辑同样移至 ui 任务。 */
 
 /* ==========================================================================
  * 入口
@@ -558,17 +661,23 @@ void app_main(void)
         ESP_LOGE(TAG, "fpga link init failed, alarm output disabled");
     }
 
+    /* 可视化设置：NVS 恢复后把蜂鸣器配置（0x03）下发 FPGA。
+     * OLED 对比度/遥测周期在 UI 任务中等面板就绪后应用。 */
+    (void)settings_init();
+    if (g_fpga_ok) {
+        settings_apply_audio();
+    }
+
     /* Wi-Fi SoftAP */
     wifi_init_softap();
 
     /* UDP 收包 + 判定任务 */
     xTaskCreate(udp_pose_task, "udp_pose", 4096, NULL, 5, NULL);
 
-    /* OLED 状态显示任务（优先级 2，低于收包） */
+    /* 多页面 UI + 键盘导航 + 演示剧本（OLED 就绪时启动；内部含
+     * fpga_uplink 接收任务，优先级 2，低于收包任务） */
 #if ENABLE_OLED
-    if (g_status_mtx != NULL && oled_ready()) {
-        xTaskCreate(oled_task, "oled", 3072, NULL, 2, NULL);
-    }
+    ui_app_start();
 #endif
 
     ESP_LOGI(TAG, "main init done");

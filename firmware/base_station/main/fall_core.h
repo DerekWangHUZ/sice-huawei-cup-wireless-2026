@@ -216,6 +216,18 @@ fall_state_t fall_detector_tick(fall_detector_t *d, uint32_t now_ms);
 /* 是否处于告警态（state == CONFIRMED） */
 bool fall_detector_alarm_active(const fall_detector_t *d);
 
+/*
+ * 人工解除告警（操作者显式命令，供 OLED 侧二次确认后调用）。
+ *
+ * 语义与边界：
+ *   - 只对 CONFIRMED 生效：把状态置回 IDLE 并清除冲击/计时字段，
+ *     返回 true；其它状态一律返回 false 且不改任何字段。
+ *   - 不改变任何阈值，也不替代"持续起身活动"的自动解除判据——
+ *     两者并存：自动解除照旧工作，人工解除是额外的显式出口。
+ *   - 调用方（base_station.c）负责随后下发 CLEAR 并清除冲击幅值。
+ */
+bool fall_detector_force_clear(fall_detector_t *d);
+
 /* 状态名，日志用 */
 const char *fall_state_name(fall_state_t s);
 

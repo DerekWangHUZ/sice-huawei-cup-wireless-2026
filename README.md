@@ -19,13 +19,15 @@
 ```text
 .
 ├── firmware/                   # 嵌入式固件工程源码
-│   ├── base_station/           # [成员 A] ESP32-S3 核心主控工程 (SoftAP / CSI / SD / OLED)
-│   │   ├── main/               #    固件源码（fall_core 判定核心 / fpga_link / csi_stub
-│   │   │                       #              / oled_display / sd_log / log_fmt / board_pins）
+│   ├── base_station/           # [成员 A] ESP32-S3 核心主控工程 (SoftAP / CSI / SD / OLED 多页面)
+│   │   ├── main/               #    固件源码（fall_core 判定核心 / fpga_link+fpga_uplink 双向链路
+│   │   │                       #              / ui_proto / ui_app 多页面 / settings / oled_display
+│   │   │                       #              / csi_stub / sd_log / log_fmt / board_pins）
 │   │   └── tools/offline_test/ #    离线自测与上板发假包工具（无板可跑）
 │   ├── wearable/               # [成员 B] ESP32-CAM 穿戴标签工程 (MPU6050 / UDP推流 / 抓拍)
 │   └── coprocessor/            # [成员 A] Artix-7 FPGA 协处理器工程
-│       ├── rtl/                #    RTL 源码（uart_rx / cmd_decoder / seg_display / buzzer_ctrl / led_ctrl / top）
+│       ├── rtl/                #    RTL 源码（uart_rx/uart_tx / cmd_decoder / input_ctrl 键盘拨码
+│       │                       #              / seg_display / buzzer_ctrl / led_ctrl / top）
 │       ├── constrs/            #    引脚约束
 │       ├── sim/                #    testbench + 无头仿真脚本（run_sim.ps1）
 │       ├── program_bit.tcl     #    JTAG 下载比特流（掉电即失，改完立刻看现象用）
@@ -40,7 +42,8 @@
 │
 ├── docs/                       # 项目协作规范与参赛文档
 │   ├── 团队分工与异步协作方案.md  # 三人包干范围、自测手段与交付矩阵
-│   ├── 团队协作规范与接口契约.md  # Wi-Fi参数、18字节UDP协议、S3↔FPGA控制帧协议(§四)
+│   ├── 团队协作规范与接口契约.md  # Wi-Fi参数、18字节UDP协议、S3↔FPGA双向帧协议(§四)
+│   ├── 开关按键使用说明书.md      # 面向现场操作者：拨码/键盘/OLED 五页/告警解除/排障
 │   ├── 成员A任务状态.md          # 成员 A 负责部分的当前状态
 │   ├── FPGA实验板资料参考.md     # FPGA 实验板引脚与片上资源约束
 │   ├── Vivado工程移植方案.md     # FPGA 工程移植与版本管理方案
@@ -73,17 +76,25 @@
 | `Byte 16`  | 校验和 | `uint8_t` | Byte 2~15 异或校验 (XOR) |
 | `Byte 17`  | 帧尾 | `uint8_t` | 固定 `0x0D` |
 
-### 3. 基站本地外设（OLED / microSD）
+### 3. 基站本地外设（OLED / microSD / FPGA 人机输入）
 
-| 外设 | 接口 | 引脚（ESP32-S3） | 用途 |
+| 外设 | 接口 | 引脚（ESP32-S3 / FPGA） | 用途 |
 |---|---|---|---|
-| OLED 1.3" 128x64 | I2C0 | SDA=GPIO4 / SCL=GPIO5 | 基站状态屏（中文大字）：标题栏 + 32x32 状态「正常/行走/疑似跌倒/跌倒告警」（告警 2Hz 反色闪烁）+ `PKT/SEQ` 收包活性 + `SD/F/坏帧/丢弃` |
+| OLED 1.3" 128x64 | I2C0 | SDA=GPIO4 / SCL=GPIO5 | **多页面 UI**：P0 状态（中文大字 + 告警冲击幅值定格）、P1 遥测（幅值/三轴/帧率/条形图）、P2 系统（网络/运行时长/SD/链路/判定参数）、P3 设置（8 项可视化调节，NVS 持久化）、P4 演示（场景名 + 预期声光表现 + 剧本进度）；页面优先级：告警 > 演示 > 锁定 > 轮播 |
 | microSD 模块 | SPI2 | CS=GPIO10 / SCK=GPIO12 / MOSI=GPIO11 / MISO=GPIO13 | 按契约 §2.1 记录姿态 CSV（`/DATA_001.CSV` 起按卡上已有编号递增） |
+| 4×4 矩阵键盘 | FPGA 板载 | 行 K3/M6/P10/R10，列 R12/T12/R11/T10 | 页面切换（1~5）、设置导航（A/B/C/D）、演示场景选择（0~7）；扫描+消抖在 FPGA，事件经上行 UART 报 S3 |
+| 拨码开关 sw[1]/sw[9] | FPGA 板载 | T8 / N4 | sw[1]=演示模式总开关；sw[9]=本地硬静音（含上电自检） |
 
 全量接线、电平要求与引脚避让清单见
 [基站接线表.md](hardware/schematics/基站接线表.md)。
-**现场改线只需修改 `firmware/base_station/main/board_pins.h`**（引脚与功能开关集中点）。
+**现场改线只需修改 `firmware/base_station/main/board_pins.h` 与
+`firmware/coprocessor/constrs/pins.xdc`**（两侧引脚集中点）。
 CSV 表头与行格式集中在 `firmware/base_station/main/log_fmt.c`，并由宿主机离线自测逐字节断言。
+
+FPGA 声光输出（6 位数码管整屏英文词 `HELLO/rEAdy/run/FALL` + `N.NNG` 数值、
+蜂鸣器运行期可调音/静音、12 颗 LED 动效 + 链路灯，LED12~16 禁用）
+的完整状态定义见 [团队协作规范与接口契约.md](docs/团队协作规范与接口契约.md) §4.8；
+板间为**双向 UART**（下行控制帧 + 上行 UI 帧），协议见同文档 §4。
 
 ---
 

@@ -2,6 +2,7 @@
 # gen_cjk16.ps1 -- generate 16x16 CJK dot-matrix bitmaps (SSD1306 page format)
 #
 # Usage : powershell -ExecutionPolicy Bypass -File gen_cjk16.ps1
+#         optional: -Only 0x51B2,0x51FB  (render just these code points)
 # Output: C array text + per-glyph ASCII art for visual check
 #
 # NOTE  : This file must stay ASCII-only. Windows PowerShell 5.1 parses
@@ -11,13 +12,32 @@
 # Glyphs are rendered from the local SimSun (simsun.ttc) with grid-fit
 # hinting, then ink-centred in the 16x16 cell.
 #
-# Target set (14 chars): die dao jian ce ji zhan zheng chang xing zou yi si gao jing
-#   U+8DCC U+5012 U+68C0 U+6D4B U+57FA U+7AD9 U+6B63 U+5E38
-#   U+884C U+8D70 U+7591 U+4F3C U+544A U+8B66
+# Target set (33 chars):
+#   base 14 (title + states):
+#     U+8DCC U+5012 U+68C0 U+6D4B U+57FA U+7AD9 U+6B63 U+5E38
+#     U+884C U+8D70 U+7591 U+4F3C U+544A U+8B66
+#   ui pages 19 (impact / telemetry / settings / demo pages):
+#     U+51B2 U+51FB U+8BBE U+7F6E U+6F14 U+793A U+6A21 U+5F0F
+#     U+573A U+666F U+9759 U+6B62 U+706F U+81EA U+5267 U+672C
+#     U+9065 U+7CFB U+7EDF
 # ============================================================================
 
+param(
+    [string]$Only = "",
+    [switch]$Big = $false
+)
+
+$script:UseBig = [bool]$Big
+
 $Cps = @(0x8DCC, 0x5012, 0x68C0, 0x6D4B, 0x57FA, 0x7AD9, 0x6B63, 0x5E38,
-         0x884C, 0x8D70, 0x7591, 0x4F3C, 0x544A, 0x8B66)
+         0x884C, 0x8D70, 0x7591, 0x4F3C, 0x544A, 0x8B66,
+         0x51B2, 0x51FB, 0x8BBE, 0x7F6E, 0x6F14, 0x793A, 0x6A21, 0x5F0F,
+         0x573A, 0x666F, 0x9759, 0x6B62, 0x706F, 0x81EA, 0x5267, 0x672C,
+         0x9065, 0x7CFB, 0x7EDF)
+
+if ($Only -ne "") {
+    $Cps = $Only.Split(',') | ForEach-Object { [Convert]::ToInt64($_.Trim(), 16) }
+}
 
 Add-Type -AssemblyName System.Drawing
 
@@ -53,7 +73,11 @@ function Render-At([int]$cp, [int]$emSize, [int]$dx, [int]$dy) {
 }
 
 function Render-Glyph([int]$cp) {
-    foreach ($size in @(16, 15, 14, 13, 12)) {
+    # -Big：为数字/字母这类"矮字形"用更大字号渲染，使其墨迹填满 16 行，
+    # 与中文 16x16 同高（否则数字只占上半 8 行，与中文混排时明显偏小）。
+    $sizes = @(16, 15, 14, 13, 12)
+    if ($script:UseBig) { $sizes = @(24, 23, 22, 21, 20, 19, 18) }
+    foreach ($size in $sizes) {
         $probe = Render-At $cp $size 0 0
         $ink = Get-InkBox $probe
         if ($ink.empty) { $probe.Dispose(); continue }

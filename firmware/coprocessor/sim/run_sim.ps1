@@ -57,7 +57,9 @@ Remove-Item -Path (Join-Path $SimDir '*.pb')  -Force -ErrorAction SilentlyContin
 # ---------------------------------------------------------------------------
 $Sources = @(
     (Join-Path $SrcDir 'uart_rx.v'),
+    (Join-Path $SrcDir 'uart_tx.v'),
     (Join-Path $SrcDir 'cmd_decoder.v'),
+    (Join-Path $SrcDir 'input_ctrl.v'),
     (Join-Path $SrcDir 'seg_display.v'),
     (Join-Path $SrcDir 'buzzer_ctrl.v'),
     (Join-Path $SrcDir 'led_ctrl.v'),
