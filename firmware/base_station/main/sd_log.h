@@ -45,6 +45,14 @@ esp_err_t sd_log_init(void);
 /* 记录是否处于可用（已挂载且未发生写错误）状态 */
 bool sd_log_ready(void);
 
+/*
+ * 卡在位探活：六脚模块无卡检测脚，拔卡后固件原本无从得知。
+ * 用一次廉价的 f_sync 判断，失败即降级（sd_log_ready() 随之返回 false，
+ * OLED 主页显示"内存卡未插入"）。由 UI 任务低频（约 5s）调用。
+ * 返回 true = 仍可用。
+ */
+bool sd_log_probe(void);
+
 /* 生产者接口：非阻塞入队。队列满则丢弃并计数。可从任务上下文调用。 */
 void sd_log_push(const sd_log_item_t *item);
 

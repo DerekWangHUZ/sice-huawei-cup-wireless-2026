@@ -284,6 +284,31 @@ esp_err_t sd_log_init(void)
 {
     esp_err_t err;
 
+    /*
+     * 可重入保护：本函数会被 sd_log_probe() 在"卡恢复"时再次调用。
+     * 先把上一次残留的资源收干净，避免重复建 ringbuffer / 多任务。
+     */
+    if (s_task != NULL) {
+        /* 旧任务已自行退出（fail 路径会置 s_task=NULL），此处防御性处理 */
+        s_task = NULL;
+    }
+    if (s_fp != NULL) {
+        fclose(s_fp);
+        s_fp = NULL;
+    }
+    if (s_rb != NULL) {
+        vRingbufferDelete(s_rb);
+        s_rb = NULL;
+    }
+    if (s_card != NULL) {
+        esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, s_card);
+        s_card = NULL;
+        /* 卸载后必须释放 SPI 总线，否则下一次 sd_mount() 的
+         * spi_bus_initialize 会返回 ESP_ERR_INVALID_STATE 而永久失败 */
+        spi_bus_free(SD_SPI_HOST);
+    }
+    s_ready = false;
+
     s_rb = xRingbufferCreateNoSplit(sizeof(sd_log_item_t), SD_LOG_QUEUE_ITEMS);
     if (s_rb == NULL) {
         ESP_LOGE(TAG, "ringbuffer create failed");
@@ -329,6 +354,66 @@ esp_err_t sd_log_init(void)
 bool sd_log_ready(void)
 {
     return s_ready && s_fp != NULL;
+}
+
+/*
+ * 卡在位探活 + 自动恢复。
+ *
+ * 判据：**直接读卡的引导扇区（LBA 0）**。
+ *   这是真实的硬件访问，不经过 VFS 缓冲/FATFS 缓存：
+ *   卡在位 -> CMD17 正常返回；卡拔出 -> 超时/CRC 错，立即失败。
+ *   之前用 fflush() 推断是错的——flush 只碰内存缓冲，卡拔了也可能"成功"，
+ *   卡在着也可能因缓冲满而失败，两个方向都会误判。
+ *
+ * 稳定性约束：
+ *   1) 连续 SD_PROBE_FAIL_MAX 次失败才降级（防单次 SPI 抖动误判）；
+ *   2) 降级后周期性尝试重新挂载，卡插回即自动恢复。
+ *
+ * 由 UI 任务低频（约 5s）调用。返回 true = 记录功能当前可用。
+ */
+#define SD_PROBE_FAIL_MAX   3
+
+static bool sd_card_alive(void)
+{
+    uint8_t buf[512];
+
+    if (s_card == NULL) {
+        return false;
+    }
+    /* 读引导扇区：卡不在位时返回非 ESP_OK */
+    return (sdmmc_read_sectors(s_card, buf, 0, 1) == ESP_OK);
+}
+
+bool sd_log_probe(void)
+{
+    static int fail_cnt = 0;
+
+    /* --- 已降级：尝试重新挂载（卡插回后自动恢复） --- */
+    if (!s_ready || s_fp == NULL) {
+        if (sd_log_init() == ESP_OK) {
+            fail_cnt = 0;
+            ESP_LOGI(TAG, "SD recovered: logging re-enabled");
+            return true;
+        }
+        return false;
+    }
+
+    /* --- 在线：真实读扇区判断卡是否还在 --- */
+    if (!sd_card_alive()) {
+        if (++fail_cnt < SD_PROBE_FAIL_MAX) {
+            ESP_LOGW(TAG, "SD probe fail %d/%d (retrying)",
+                     fail_cnt, SD_PROBE_FAIL_MAX);
+            return true;                     /* 未达阈值，仍视为可用 */
+        }
+        ESP_LOGW(TAG, "SD removed (probe failed %d times)", fail_cnt);
+        fclose(s_fp);
+        s_fp    = NULL;
+        s_ready = false;
+        return false;
+    }
+
+    fail_cnt = 0;                            /* 成功即清零 */
+    return true;
 }
 
 void sd_log_push(const sd_log_item_t *item)

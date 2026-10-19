@@ -14,6 +14,8 @@
 #include "fpga_link.h"
 
 #include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -33,7 +35,11 @@ static int64_t s_last_tx_us = 0;
 
 #define CMD_ALARM     0x01u
 #define CMD_CLEAR     0x02u
+#define CMD_SET_AUDIO 0x03u
 #define CMD_SET_STATE 0x10u
+
+/* 发送互斥：收包判定任务 / 演示剧本任务 / 设置模块都会下发帧 */
+static SemaphoreHandle_t s_tx_mtx = NULL;
 
 esp_err_t fpga_link_init(void)
 {
@@ -53,8 +59,8 @@ esp_err_t fpga_link_init(void)
     }
 
     err = uart_set_pin(FPGA_UART_PORT,
-                       FPGA_UART_TX_GPIO,   /* tx */
-                       FPGA_UART_RX_GPIO,   /* rx（不接） */
+                       FPGA_UART_TX_GPIO,   /* tx -> FPGA rxd */
+                       FPGA_UART_RX_GPIO,   /* rx <- FPGA 上行 UI 帧 */
                        UART_PIN_NO_CHANGE,
                        UART_PIN_NO_CHANGE);
     if (err != ESP_OK) {
@@ -62,15 +68,24 @@ esp_err_t fpga_link_init(void)
         return err;
     }
 
-    /* TX only 实用；rx 缓冲仅满足驱动合法性检查（> HW FIFO），永不读取 */
+    /* TX + RX：RX 缓冲 > HW FIFO（驱动合法性要求），由 fpga_uplink 任务读取 */
     err = uart_driver_install(FPGA_UART_PORT, FPGA_UART_RX_BUF, 0, 0, NULL, 0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "uart_driver_install failed: %s", esp_err_to_name(err));
         return err;
     }
 
-    ESP_LOGI(TAG, "UART link ready: port=%d tx_gpio=%d baud=%d",
-             FPGA_UART_PORT, FPGA_UART_TX_GPIO, FPGA_UART_BAUDRATE);
+    if (s_tx_mtx == NULL) {
+        s_tx_mtx = xSemaphoreCreateMutex();
+        if (s_tx_mtx == NULL) {
+            ESP_LOGE(TAG, "tx mutex create failed");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    ESP_LOGI(TAG, "UART link ready: port=%d tx=%d rx=%d baud=%d",
+             FPGA_UART_PORT, FPGA_UART_TX_GPIO, FPGA_UART_RX_GPIO,
+             FPGA_UART_BAUDRATE);
     return ESP_OK;
 }
 
@@ -96,7 +111,13 @@ esp_err_t fpga_link_send_cmd_ex(uint8_t cmd, uint8_t p1, uint16_t p2, bool verbo
     frame[6] = x;
     frame[7] = FRAME_TAIL;
 
-    /* 帧间隔保护：不足则忙等补足（8 字节 @115200 约 0.7ms，等待极短） */
+    if (s_tx_mtx == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    xSemaphoreTake(s_tx_mtx, portMAX_DELAY);
+
+    /* 帧间隔保护：不足则忙等补足（8 字节 @115200 约 0.7ms，等待极短）。
+     * 忙等在互斥量内进行，保证多任务并发下帧间隔仍然成立。 */
     if (s_last_tx_us != 0) {
         int64_t now_us = esp_timer_get_time();
         int64_t gap_us = (int64_t)FPGA_TX_GAP_MS * 1000;
@@ -107,6 +128,7 @@ esp_err_t fpga_link_send_cmd_ex(uint8_t cmd, uint8_t p1, uint16_t p2, bool verbo
 
     written = uart_write_bytes(FPGA_UART_PORT, frame, sizeof(frame));
     s_last_tx_us = esp_timer_get_time();
+    xSemaphoreGive(s_tx_mtx);
 
     if (written != (int)sizeof(frame)) {
         ESP_LOGW(TAG, "short write: %d bytes", written);
@@ -155,4 +177,13 @@ esp_err_t fpga_link_send_state_change(fall_state_t st, uint16_t mag_x100)
     /* 状态变化沿（契约 §4.5 第 1 条）：保留逐帧 INFO 日志，
      * 作为"状态同步已下发"的验收信号。 */
     return fpga_link_send_cmd_ex(CMD_SET_STATE, (uint8_t)st, mag_x100, true);
+}
+
+esp_err_t fpga_link_send_audio(uint8_t mute, uint8_t pend_beep, uint16_t tone_half_div)
+{
+    /* 0x03 SET_AUDIO：bit0=静音 bit1=待确认提示音，p2=载波半周期（0=默认） */
+    return fpga_link_send_cmd(CMD_SET_AUDIO,
+                              (uint8_t)((mute ? 0x01u : 0u) |
+                                        (pend_beep ? 0x02u : 0u)),
+                              tone_half_div);
 }

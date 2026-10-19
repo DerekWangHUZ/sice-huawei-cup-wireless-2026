@@ -19,7 +19,12 @@
 //   0x01 ALARM     -> alarm_on  = 1
 //   0x02 CLEAR     -> alarm_on  = 0
 //   0x10 SET_STATE -> state_code = p1[1:0]，mag_x100 = p2，mag_valid = 1
+//   0x03 SET_AUDIO -> audio_mute = p1[0]，pend_beep_en = p1[1]，
+//                     tone_div = p2（0 = 使用默认载波半周期）
 //   其它命令码     -> 静默丢弃（无 cmd_valid、无 cmd_error、状态不变）
+//
+//   任何一条已知命令解出（cmd_valid）都会置位 ever_linked 并保持到复位：
+//   seg_display 据此区分「无链路」（HELLO 慢闪）与「已链路待机」两种画面。
 //
 //   SET_STATE 的 p2 为 16 位遥测字：合加速度幅值，单位 0.01g（小端，
 //   p2_lo 在前）。0xFFFF 为"暂无有效遥测"哨兵，此时数码管读数位显示
@@ -35,6 +40,10 @@
 //   mag_valid   最近一次 SET_STATE 的遥测是否有效（p2 != 0xFFFF）
 //   mag_update  单周期脉冲：收到一帧"有效遥测"的 SET_STATE（供 seg_display
 //               复位读数老化计时器；哨兵帧不产生该脉冲）
+//   audio_mute  持续电平：0x03 命令的蜂鸣器静音位（与拨码本地静音相"或"）
+//   pend_beep_en 持续电平：待确认（状态 2）1Hz 提示音使能
+//   tone_div    运行期载波半周期（0 = seg/buzzer 使用默认值 9260 -> 2.7kHz）
+//   ever_linked 持续电平：解出过任一已知命令（复位清除）——链路曾建立
 //   cmd_valid   单周期脉冲：识别出一个合法且已知的命令帧
 //   cmd_error   单周期脉冲：帧头命中但校验/帧尾失败
 //
@@ -67,6 +76,10 @@ module cmd_decoder (
     output reg [15:0] mag_x100,
     output reg        mag_valid,
     output reg        mag_update,
+    output reg        audio_mute,
+    output reg        pend_beep_en,
+    output reg [15:0] tone_div,
+    output reg        ever_linked,
     output reg        cmd_valid,
     output reg        cmd_error
 );
@@ -79,6 +92,7 @@ module cmd_decoder (
     localparam [7:0] TAIL           = 8'h0D;
     localparam [7:0] CMD_ALARM      = 8'h01;
     localparam [7:0] CMD_CLEAR      = 8'h02;
+    localparam [7:0] CMD_SET_AUDIO  = 8'h03;
     localparam [7:0] CMD_SET_STATE  = 8'h10;
 
     //------------------------------------------------------------------
@@ -112,6 +126,7 @@ module cmd_decoder (
     // 命令白名单
     wire known_now = (n2 == CMD_ALARM) ||
                       (n2 == CMD_CLEAR) ||
+                      (n2 == CMD_SET_AUDIO) ||
                       (n2 == CMD_SET_STATE);
 
     //------------------------------------------------------------------
@@ -119,14 +134,18 @@ module cmd_decoder (
     //------------------------------------------------------------------
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            shift      <= 64'h0;
-            alarm_on   <= 1'b0;
-            state_code <= 2'd0;
-            mag_x100   <= 16'd0;
-            mag_valid  <= 1'b0;
-            mag_update <= 1'b0;
-            cmd_valid  <= 1'b0;
-            cmd_error  <= 1'b0;
+            shift        <= 64'h0;
+            alarm_on     <= 1'b0;
+            state_code   <= 2'd0;
+            mag_x100     <= 16'd0;
+            mag_valid    <= 1'b0;
+            mag_update   <= 1'b0;
+            audio_mute   <= 1'b0;
+            pend_beep_en <= 1'b0;
+            tone_div     <= 16'd0;
+            ever_linked  <= 1'b0;
+            cmd_valid    <= 1'b0;
+            cmd_error    <= 1'b0;
         end else begin
             // 脉冲信号默认拉低，仅命中当拍为高
             cmd_valid  <= 1'b0;
@@ -138,14 +157,20 @@ module cmd_decoder (
                 shift <= {shift[55:0], byte_data};
 
                 if (frame_now && known_now) begin
-                    cmd_valid <= 1'b1;
+                    cmd_valid   <= 1'b1;
+                    ever_linked <= 1'b1;          // 任一已知命令 = S3 链路存在过
                     case (n2)
                         CMD_ALARM:     alarm_on   <= 1'b1;
                         CMD_CLEAR:     alarm_on   <= 1'b0;
+                        CMD_SET_AUDIO: begin
+                            audio_mute   <= n3[0];
+                            pend_beep_en <= n3[1];
+                            tone_div     <= {n5, n4};   // 0 = 使用默认载波
+                        end
                         CMD_SET_STATE: begin
                             state_code <= n3[1:0];
                             mag_x100   <= {n5, n4};   // p2 小端：低字节在前
-                            // 0xFFFF = "暂无有效遥测"哨兵 -> 数码管显示 "----"
+                            // 0xFFFF = "暂无有效遥测"哨兵 -> 待确认无值显示 "------"
                             mag_valid  <= ({n5, n4} != 16'hFFFF);
                             // 只有"有效遥测"才刷新 seg_display 的老化计时器
                             mag_update <= ({n5, n4} != 16'hFFFF);

@@ -224,6 +224,20 @@ bool fall_detector_alarm_active(const fall_detector_t *d)
     return (d->state == FALL_STATE_CONFIRMED);
 }
 
+bool fall_detector_force_clear(fall_detector_t *d)
+{
+    if (d == NULL || d->state != FALL_STATE_CONFIRMED) {
+        return false;
+    }
+    /* 状态回 IDLE，清掉冲击/计时记忆，避免残留影响下一轮判定 */
+    d->state            = FALL_STATE_IDLE;
+    d->impact_time_ms   = 0;
+    d->motion_start_ms  = 0;
+    d->calm_start_ms    = 0;
+    d->confirm_time_ms  = 0;
+    return true;
+}
+
 #if POSTURE_CHECK_ENABLE
 /*
  * 姿态门：确认跌倒前检查人是否处于"躺平"朝向（默认关闭，见 fall_core.h）。
@@ -373,9 +387,8 @@ fall_state_t fall_detector_feed(fall_detector_t *d,
      * 确认判据（2026-10-18 修订，对齐文献 post-fall-inactivity 标准做法）：
      *   冲击后【持续】静止（gyro_quiet && acc_near_g）累计满 STILL_WINDOW_MS
      *   即确认；静止被运动打断则计时清零重来。
-     *   旧实现是"快照式"——只在冲击后恰满 STILL_WINDOW_MS 的那一帧检查
-     *   是否静止，存在两条漏报路径（到期帧恰逢抽动 / 静止晚于到期才出现），
-     *   已废弃。
+     *   采用持续计时而非"到期帧单点检查"，避免两条漏报路径
+     *   （到期帧恰逢抽动 / 静止晚于到期才出现）。
      * 观察上限：冲击后 PENDING_MAX_MS 内仍未确认 -> 按非跌倒退出。
      *   防止"碰撞后继续走动、随后才坐下静止"在长观察期内被误确认
      *   （到期时坐下静止尚不足 STILL_WINDOW_MS）。
@@ -463,8 +476,8 @@ fall_state_t fall_detector_feed(fall_detector_t *d,
  *   只管掉线保护（DATA_TIMEOUT_MS 无数据回 IDLE），且**不适用于
  *   CONFIRMED**——数据停摆时告警必须保持（人昏迷 + 设备故障恰是
  *   最需要报警的时刻），告警只由"持续起身活动"解除（feed 段 5）。
- *   历史教训：曾用 ALARM_HOLD 定时解除（人躺地上报警却停了）和
- *   停摆掉线解除（告警被 3s 掉线掐成 1~3s），均已废弃。
+ *   定时解除与掉线解除都不可取：前者在人躺地昏迷时会让报警自停，
+ *   后者会被 3s 掉线保护掐成 1~3s。故本函数只做掉线保护。
  * 只读 last_frame_ms（帧时间戳）不修改；被周期调用时若状态已是
  * 目标态则为幂等空操作。
  */

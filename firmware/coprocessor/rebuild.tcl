@@ -166,11 +166,15 @@ set obj [get_filesets sources_1]
 #       uart_rx / cmd_decoder / seg_display / buzzer_ctrl added alongside top.
 #       2026-10-18: led_ctrl.v added (LED effect engine: breathing / chase /
 #       KITT scan / beep-synced strobe).
+#       2026-10-19: uart_tx.v + input_ctrl.v added (UI uplink + 4x4 keypad /
+#       DIP input / demo scenes).
 #       Keep in sync with rtl/*.v -- adding or
 #       removing a source file requires re-exporting this script.
 set files [list \
  [file normalize "${origin_dir}/rtl/uart_rx.v" ]\
+ [file normalize "${origin_dir}/rtl/uart_tx.v" ]\
  [file normalize "${origin_dir}/rtl/cmd_decoder.v" ]\
+ [file normalize "${origin_dir}/rtl/input_ctrl.v" ]\
  [file normalize "${origin_dir}/rtl/seg_display.v" ]\
  [file normalize "${origin_dir}/rtl/buzzer_ctrl.v" ]\
  [file normalize "${origin_dir}/rtl/led_ctrl.v" ]\

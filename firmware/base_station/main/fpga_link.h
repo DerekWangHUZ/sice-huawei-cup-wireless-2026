@@ -26,7 +26,7 @@
 /* --- 硬件连接（改板子接线时只改这里） --- */
 #define FPGA_UART_PORT      UART_NUM_1
 #define FPGA_UART_TX_GPIO   17        /* S3 的 TX -> FPGA rxd(B15，右扩展排母上排第 1 脚，契约 §4.1；共地) */
-#define FPGA_UART_RX_GPIO   (-1)      /* 本期不接收，不分配 RX 引脚 */
+#define FPGA_UART_RX_GPIO   18        /* S3 的 RX <- FPGA txd（上行 UI 帧，UART1 默认 RX 脚；共地） */
 #define FPGA_UART_BAUDRATE  115200
 
 /* 帧间隔保护：协议要求 >= 1ms，这里留裕量取 2ms */
@@ -56,5 +56,9 @@ esp_err_t fpga_link_send_state_telemetry(fall_state_t st, uint16_t mag_x100);
 /* 0x10 + 遥测，日志为 INFO。状态变化沿用这个，
  * 保留既有验收信号 `TX cmd=0x10 p1=...`。 */
 esp_err_t fpga_link_send_state_change(fall_state_t st, uint16_t mag_x100);
+
+/* 0x03 SET_AUDIO：运行期蜂鸣器配置（bit0=静音 bit1=待确认提示音；
+ * p2=载波半周期，0=FPGA 默认 2.7kHz）。设置页改动与上电恢复时调用。 */
+esp_err_t fpga_link_send_audio(uint8_t mute, uint8_t pend_beep, uint16_t tone_half_div);
 
 #endif /* FPGA_LINK_H */

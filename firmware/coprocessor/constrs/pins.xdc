@@ -36,17 +36,58 @@ set_property IOSTANDARD  LVCMOS33 [get_ports rst_n]
 set_property PULLUP true [get_ports rst_n]
 
 ##================================================================
-## 3. UART：rx 接 S3 的 TX
-##    实测勘误（2026-10-16）：课程资料 §4 写的 F12/F13 在本板接的是
-##    板上 USB-UART 桥（板右侧 UART USB 口），排针上没有 F13。
-##    S3 对接改用扩展排母空闲脚 B15（右排母上排第 1 脚，同排末位即 GND）。
-##    rxd = B15（FPGA 接收，来自 ESP32-S3 GPIO17）
-##    txd = F12（板上 USB-UART 桥，本期不驱动，恒 1）
+## 3. UART：rx 接 S3 的 TX；tx 为 FPGA->S3 上行链路
+##    下行：S3 GPIO17(TX) -> FPGA B15（右扩展排母上排第 1 脚，同排末位即 GND）
+##    上行：FPGA C14（右扩展排母，B15 邻位） -> S3 GPIO18（UART1 默认 RX）
+##    板上 USB-UART 桥（F12）与本上行链路无关；电脑要观测上行帧需把
+##    约束临时改回 F12（未接 S3 观测用，正常接 S3 时用 C14）。
 ##================================================================
 set_property PACKAGE_PIN B15 [get_ports rxd]
 set_property IOSTANDARD  LVCMOS33 [get_ports rxd]
-set_property PACKAGE_PIN F12 [get_ports txd]
+set_property PACKAGE_PIN C14 [get_ports txd]
 set_property IOSTANDARD  LVCMOS33 [get_ports txd]
+
+##================================================================
+## 3b. 拨码开关（辅助输入，仅"持久电平"型功能）
+##     板上拨码丝印为 SW1~SW11（T9 那颗是复位按键，不是拨码，故 SW 编号
+##     从 T8 起算）：
+##       SW1 = T8   演示模式总开关（0=正常运行 1=演示模式）
+##       SW2 = T7   本地硬静音（1=蜂鸣器完全静音，含 POST）
+##     引脚出处：资料 §6。
+##================================================================
+set_property PACKAGE_PIN T8 [get_ports sw_demo]
+set_property IOSTANDARD  LVCMOS33 [get_ports sw_demo]
+set_property PULLUP true [get_ports sw_demo]
+set_property PACKAGE_PIN T7 [get_ports sw_mute]
+set_property IOSTANDARD  LVCMOS33 [get_ports sw_mute]
+set_property PULLUP true [get_ports sw_mute]
+
+##================================================================
+## 3c. 4x4 矩阵键盘（主输入：页面/设置/演示场景导航）
+##     引脚出处：资料 §5（电子琴实验 XDC，列线上拉惯例）。
+##     行 = 输出逐行扫描（低有效）；列 = 输入 + 内部上拉（按下=低）。
+##     若上板实测无响应，先把行列角色对调，再考虑换 PULLDOWN。
+##================================================================
+set_property PACKAGE_PIN K3  [get_ports {key_row[0]}]
+set_property PACKAGE_PIN M6  [get_ports {key_row[1]}]
+set_property PACKAGE_PIN P10 [get_ports {key_row[2]}]
+set_property PACKAGE_PIN R10 [get_ports {key_row[3]}]
+set_property PACKAGE_PIN R12 [get_ports {key_col[0]}]
+set_property PACKAGE_PIN T12 [get_ports {key_col[1]}]
+set_property PACKAGE_PIN R11 [get_ports {key_col[2]}]
+set_property PACKAGE_PIN T10 [get_ports {key_col[3]}]
+set_property IOSTANDARD LVCMOS33 [get_ports {key_row[3]}]
+set_property IOSTANDARD LVCMOS33 [get_ports {key_row[2]}]
+set_property IOSTANDARD LVCMOS33 [get_ports {key_row[1]}]
+set_property IOSTANDARD LVCMOS33 [get_ports {key_row[0]}]
+set_property IOSTANDARD LVCMOS33 [get_ports {key_col[3]}]
+set_property IOSTANDARD LVCMOS33 [get_ports {key_col[2]}]
+set_property IOSTANDARD LVCMOS33 [get_ports {key_col[1]}]
+set_property IOSTANDARD LVCMOS33 [get_ports {key_col[0]}]
+set_property PULLUP true [get_ports {key_col[3]}]
+set_property PULLUP true [get_ports {key_col[2]}]
+set_property PULLUP true [get_ports {key_col[1]}]
+set_property PULLUP true [get_ports {key_col[0]}]
 
 ##================================================================
 ## 4. 蜂鸣器：L2（资料 §8，电子琴实验 XDC）
@@ -76,8 +117,10 @@ set_property PACKAGE_PIN N14 [get_ports {an[4]}]
 set_property PACKAGE_PIN N11 [get_ports {an[5]}]
 
 ##================================================================
-## 6. LED 16 颗，高电平点亮（资料 §3）
-##    注意：led[15]=M1 在该板物理不亮，属板卡个体硬件问题，验收忽略。
+## 6. LED（16 个引脚约束，资料 §3）
+##    项目要求 LED12~LED16 禁用：本工程只驱动 led[0..11]（板上主排 12 颗），
+##    led[15:12] 在 RTL 内恒灭（引脚约束保留，RTL 已保证不点亮）。
+##    板上另有一颗丝印 LED16 无课程引脚映射，从未被驱动。
 ##================================================================
 set_property PACKAGE_PIN P9  [get_ports {led[0]}]
 set_property PACKAGE_PIN R8  [get_ports {led[1]}]

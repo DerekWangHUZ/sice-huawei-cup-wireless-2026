@@ -12,12 +12,14 @@
 #include "oled_display.h"
 #include "board_pins.h"
 #include "font_cjk16.h"
+#include "settings.h"
 
 #include <stdio.h>
 #include <string.h>
 
 #include "driver/i2c_master.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 static const char *TAG = "OLED";
 
@@ -164,6 +166,45 @@ static uint32_t s_err_count = 0;
 
 /* 告警闪烁相位：每次刷新翻转一次（250ms 刷新 -> 2Hz 反色闪烁） */
 static bool s_blink = false;
+
+/* 面板左侧遮挡补偿：实测本屏左侧约 2 列被外框遮挡，右侧完整。
+ * 绘制安全区宽度 = 128 - 左侧遮挡列数；内容绘制在 [0, s_draw_w)，
+ * 推送时整体右移 s_x_shift 列落到 [s_x_shift, 128)，因此右侧满幅可用。 */
+static uint8_t s_x_shift  = 2;
+static uint8_t s_draw_w   = OLED_WIDTH - 2;
+static bool    s_full_refresh = false;
+
+/* 状态大字区的临时提示（2s 内显示，调用方负责清除） */
+static char s_hint[12];
+
+void oled_set_hint(const char *utf8)
+{
+    if (utf8 == NULL || utf8[0] == '\0') {
+        s_hint[0] = '\0';
+    } else {
+        snprintf(s_hint, sizeof(s_hint), "%s", utf8);
+    }
+}
+
+/* 反色标题栏：居中 CJK 标题（页码标识已取消，各页不再显示 x/5） */
+static void draw_title(uint8_t page_top, const char *cjk, uint8_t page_no)
+{
+    const char *p = cjk;
+    uint8_t n = 0;
+    uint8_t x;
+
+    (void)page_no;                       /* 形参保留以兼容既有调用点 */
+
+    while (*p != '\0') {
+        if ((uint8_t)*p >= 0x80u) { p += 3; n++; }   /* UTF-8 中文 3 字节 */
+        else                                     { p += 1; }
+    }
+
+    oled_fill_page(page_top, 0xFF);
+    oled_fill_page((uint8_t)(page_top + 1u), 0xFF);
+    x = (uint8_t)((s_draw_w - n * CJK16_W) / 2u);
+    oled_draw_text_inv(page_top, x, cjk);
+}
 
 /* ==========================================================================
  * 底层 I2C 收发
@@ -436,7 +477,7 @@ static void blit16(uint8_t page, uint8_t x, const uint8_t *bits, bool inv)
     uint8_t h;
     uint8_t c;
 
-    if (bits == NULL || (uint16_t)x + CJK16_W > OLED_WIDTH ||
+    if (bits == NULL || (uint16_t)x + CJK16_W > s_draw_w ||
         (uint16_t)page + 1u >= OLED_PAGES) {
         return;
     }
@@ -461,7 +502,7 @@ static void blit16_2x(uint8_t page, uint8_t x, const uint8_t *bits, bool inv)
     uint8_t c;
     uint8_t r;
 
-    if (bits == NULL || (uint16_t)x + 2u * CJK16_W > OLED_WIDTH ||
+    if (bits == NULL || (uint16_t)x + 2u * CJK16_W > s_draw_w ||
         (uint16_t)page + 3u >= OLED_PAGES) {
         return;
     }
@@ -506,7 +547,7 @@ static void draw_char_ex(uint8_t page, uint8_t x, char ch, bool inv)
     const uint8_t *glyph;
     uint8_t       i;
 
-    if (x + FONT_CELL > OLED_WIDTH) {
+    if (x + FONT_CELL > s_draw_w) {
         return;                       /* 越界整字丢弃 */
     }
 
@@ -535,7 +576,7 @@ void oled_draw_row(uint8_t page, const char *text)
     if (page >= OLED_PAGES || text == NULL) {
         return;
     }
-    while (*text != '\0' && (uint8_t)(x + FONT_CELL) <= OLED_WIDTH) {
+    while (*text != '\0' && (uint8_t)(x + FONT_CELL) <= s_draw_w) {
         draw_char_ex(page, x, *text, false);
         x = (uint8_t)(x + FONT_CELL);
         text++;
@@ -556,7 +597,7 @@ static void draw_text_ex(uint8_t page, uint8_t x, const char *utf8, bool inv)
         }
 
         if (cp < 0x80u) {                   /* ASCII：6x8 单元格 */
-            if ((uint16_t)x + FONT_CELL > OLED_WIDTH) {
+            if ((uint16_t)x + FONT_CELL > s_draw_w) {
                 break;
             }
             draw_char_ex(page, x, (char)cp, inv);
@@ -566,7 +607,7 @@ static void draw_text_ex(uint8_t page, uint8_t x, const char *utf8, bool inv)
             if (bits == NULL) {
                 bits = s_cjk_missing;
             }
-            if ((uint16_t)x + CJK16_W > OLED_WIDTH) {
+            if ((uint16_t)x + CJK16_W > s_draw_w) {
                 break;
             }
             blit16(page, x, bits, inv);
@@ -610,7 +651,7 @@ void oled_draw_big_text(uint8_t page, const char *utf8, bool inv)
         return;
     }
 
-    x = (width >= OLED_WIDTH) ? 0u : (uint8_t)((OLED_WIDTH - width) / 2u);
+    x = (width >= s_draw_w) ? 0u : (uint8_t)((s_draw_w - width) / 2u);
 
     /* 第二遍：绘制 */
     p = utf8;
@@ -623,7 +664,7 @@ void oled_draw_big_text(uint8_t page, const char *utf8, bool inv)
         if (bits == NULL) {
             bits = s_cjk_missing;
         }
-        if ((uint16_t)x + 2u * CJK16_W > OLED_WIDTH) {
+        if ((uint16_t)x + 2u * CJK16_W > s_draw_w) {
             break;
         }
         blit16_2x(page, x, bits, inv);
@@ -631,21 +672,228 @@ void oled_draw_big_text(uint8_t page, const char *utf8, bool inv)
     }
 }
 
+/* 面板左侧遮挡补偿：由 oled_set_x_shift() 调整 s_x_shift / s_draw_w */
+void oled_set_x_shift(uint8_t shift)
+{
+    if (shift > 6u) {
+        shift = 6u;
+    }
+    if (shift != s_x_shift) {
+        s_x_shift      = shift;
+        s_draw_w       = (uint8_t)(OLED_WIDTH - shift);
+        s_full_refresh = true;      /* 偏移变化后必须整屏重刷 */
+    }
+}
+
+void oled_force_full_refresh(void)
+{
+    s_full_refresh = true;
+}
+
+/* 把 16x16 字模按带符号 x 写入帧缓存（允许 x<0：左侧越界列整列跳过）。
+ * 供横向滚动文本使用；不改变既有 blit16 的行为。 */
+static void blit16_clip(uint8_t page, int16_t x, const uint8_t *bits, bool inv)
+{
+    uint8_t h;
+    uint8_t c;
+
+    if (bits == NULL || (uint16_t)page + 1u >= OLED_PAGES) {
+        return;
+    }
+    for (h = 0; h < 2u; h++) {
+        uint8_t *dst = s_fb[page + h];
+        for (c = 0; c < CJK16_W; c++) {
+            int16_t dx = (int16_t)(x + (int16_t)c);
+            uint8_t b  = bits[(size_t)h * CJK16_W + c];
+            if (dx < 0 || dx >= (int16_t)s_draw_w) {
+                continue;                    /* 越界列丢弃（裁剪） */
+            }
+            if (inv) {
+                dst[dx] &= (uint8_t)~b;
+            } else {
+                dst[dx] |= b;
+            }
+        }
+    }
+}
+
+
+/* 在页内绘制单个字符，允许带符号 x（越界列丢弃）。供滚动文本使用。 */
+static void draw_char_clip(uint8_t page, int16_t x, char ch)
+{
+    uint8_t idx = (uint8_t)ch;
+    uint8_t i;
+    const uint8_t *glyph;
+
+    if (idx < 0x20u || idx > 0x7Eu) {
+        idx = (uint8_t)'?';
+    }
+    glyph = s_font5x7[idx - 0x20u];
+    for (i = 0; i < FONT_W; i++) {
+        int16_t dx = (int16_t)(x + (int16_t)i);
+        if (dx < 0 || dx >= (int16_t)s_draw_w) {
+            continue;
+        }
+        s_fb[page][dx] |= glyph[i];
+    }
+}
+
+/* 在指定页横向滚动绘制中英混排文本。
+ *   x_off  当前滚动偏移（可为负，负值表示文本已滚出左侧）
+ * 返回文本像素总宽度。
+ *
+ * 注意：ASCII 必须真正绘制（6 列/字），不能只占位——否则 " | " 分隔符
+ * 与 "FPGA:" / "GPIO18" 这类英文片段在屏幕上会凭空消失。 */
+static uint16_t marquee_cjk(uint8_t page, int16_t x_off, const char *utf8)
+{
+    int16_t  x = x_off;
+    uint16_t w = 0;
+
+    if (utf8 == NULL) {
+        return 0;
+    }
+    while (*utf8 != '\0') {
+        uint32_t cp = utf8_decode(&utf8);
+        if (cp == 0u || cp == 0xFFFDu) {
+            continue;
+        }
+        if (cp < 0x80u) {
+            draw_char_clip(page, x, (char)cp);      /* 真正绘制 6x8 ASCII */
+            x = (int16_t)(x + FONT_CELL);
+            w = (uint16_t)(w + FONT_CELL);
+            continue;
+        }
+        {
+            const uint8_t *bits = cjk16_lookup(cp);
+            if (bits == NULL) {
+                bits = s_cjk_missing;
+            }
+            blit16_clip(page, x, bits, false);
+            x = (int16_t)(x + CJK16_W);
+            w = (uint16_t)(w + CJK16_W);
+        }
+    }
+    return w;
+}
+
+
+/* 追加一段文本；若缓冲区已有内容，先用中文分隔符「、」隔开。
+ *
+ * 为什么不用 " | "：状态区是 16x16 中文行（占 2 页），而 ASCII 只画在
+ * 上页 8 行，混排时竖线只出现在上半页、看起来"上下断开错位"；
+ * 且 ASCII 与中文宽度/基线不一致会让第二项起字形错乱。
+ * 纯中文顿号在同一字模体系内，宽度与基线天然对齐。 */
+static void cat_sep(char *buf, size_t len, const char *item)
+{
+    size_t n = strlen(buf);
+
+    if (n != 0u && n + 3u < len) {
+        strncat(buf, "丨", len - n - 1u);   /* 全高竖杠，与中文同高 */
+        n += 3u;
+    }
+    if (item != NULL && n < len) {
+        strncat(buf, item, len - n - 1u);
+    }
+}
+
+
+/* 单行文本自适应绘制：放得下就静态居中/左对齐，放不下就在该页横向滚动。
+ * off 由调用方持有（static），row 为 0..7 的页号。
+ * 返回值无意义（保持调用点简洁）。 */
+static void draw_row_autoscroll(uint8_t page, int16_t *off, const char *text)
+{
+    uint16_t w = (uint16_t)(strlen(text) * 6u);   /* 6x8 等宽 */
+
+    if (w <= s_draw_w) {
+        *off = 0;
+        oled_draw_row(page, text);
+        return;
+    }
+    *off = (int16_t)(*off - 5);
+    if (*off < -(int16_t)w) {
+        *off = (int16_t)s_draw_w;
+    }
+    {
+        /* 逐字符按列偏移绘制（负偏移时跳过左侧越界字符） */
+        int16_t x = *off;
+        const char *q = text;
+        while (*q != '\0') {
+            if (x >= -(int16_t)FONT_CELL && x < (int16_t)s_draw_w) {
+                draw_char_clip(page, x, *q);
+            }
+            x = (int16_t)(x + FONT_CELL);
+            q++;
+        }
+    }
+}
+
+/* 中文/ASCII 混排文本的像素宽度 */
+static uint16_t text_width(const char *utf8)
+{
+    uint16_t w = 0;
+
+    if (utf8 == NULL) {
+        return 0;
+    }
+    while (*utf8 != '\0') {
+        if ((uint8_t)*utf8 >= 0x80u) { utf8 += 3; w = (uint16_t)(w + CJK16_W); }
+        else                         { utf8 += 1; w = (uint16_t)(w + 6u); }
+    }
+    return w;
+}
+
+/* 推进滚动偏移：未超宽恒为 0（静止显示），超宽则每帧左移 1 列，
+ * 滚完一轮后从右端重新进场。 */
+static int16_t marquee_next(int16_t off, const char *utf8)
+{
+    uint16_t need = text_width(utf8);
+
+    if (need <= s_draw_w) {
+        return 0;
+    }
+    off = (int16_t)(off - 5);   /* 250ms 一帧滚 5 列（20 列/秒） */
+    if (off < -(int16_t)need) {
+        off = (int16_t)s_draw_w;
+    }
+    return off;
+}
+
 esp_err_t oled_flush(void)
 {
     uint8_t   page;
     esp_err_t first_err = ESP_OK;
+    uint8_t   out[OLED_WIDTH];
+    uint8_t   x;
 
     if (!s_ready) {
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* 边缘补偿在下面的逐页循环里完成：安全区内容右移 s_x_shift 列，
+     * 被遮挡的左边缘与右边多出的列留黑，确保没有任何笔画落在不可见区。 */
+    if (s_full_refresh) {
+        memset(s_shadow, 0xFF, sizeof(s_shadow));   /* 强制与内容不同 */
+        s_full_refresh = false;
+    }
+
     for (page = 0; page < OLED_PAGES; page++) {
+        const uint8_t *src;
+
+        if (s_x_shift == 0u) {
+            src = s_fb[page];
+        } else {
+            memset(out, 0x00, s_x_shift);
+            for (x = 0; x + s_x_shift < OLED_WIDTH; x++) {
+                out[x + s_x_shift] = s_fb[page][x];
+            }
+            src = out;
+        }
+
         /* 内容未变的页不占 I2C 带宽（状态屏多数页是静态的） */
-        if (memcmp(s_fb[page], s_shadow[page], OLED_WIDTH) == 0) {
+        if (memcmp(src, s_shadow[page], OLED_WIDTH) == 0) {
             continue;
         }
-        esp_err_t err = oled_write_page(page, s_fb[page]);
+        esp_err_t err = oled_write_page(page, src);
         if (err != ESP_OK) {
             oled_note_error("write_page", err);
             if (first_err == ESP_OK) {
@@ -653,7 +901,7 @@ esp_err_t oled_flush(void)
             }
             continue;                /* 其余页继续尝试 */
         }
-        memcpy(s_shadow[page], s_fb[page], OLED_WIDTH);
+        memcpy(s_shadow[page], src, OLED_WIDTH);
     }
     return first_err;
 }
@@ -682,7 +930,6 @@ esp_err_t oled_show_status(const oled_status_t *s)
     const char *big;
     bool        blink_inv = false;
     uint8_t     st;
-    uint8_t     title_x;
 
     if (s == NULL) {
         return ESP_ERR_INVALID_ARG;
@@ -690,40 +937,392 @@ esp_err_t oled_show_status(const oled_status_t *s)
 
     oled_clear();
 
-    /* --- y0~15：实底反色标题栏「跌倒检测基站」（6 字 x 16 列 = 96 列） --- */
-    oled_fill_page(0, 0xFF);
-    oled_fill_page(1, 0xFF);
-    title_x = (uint8_t)((OLED_WIDTH - 6u * CJK16_W) / 2u);
-    oled_draw_text_inv(0, title_x, "跌倒检测基站");
+    /* --- y0~15：实底反色标题栏「跌倒检测基站」（主页不画页码） --- */
+    draw_title(0, "跌倒检测基站", 0);
 
-    /* --- y16~47：32x32 大号状态；告警时整条反色闪烁（2Hz） --- */
-    if (s->alarm) {
-        s_blink   = !s_blink;          /* 每次刷新翻转 -> 250ms 刷新时为 2Hz */
-        blink_inv = s_blink;
-        big       = STATE_TXT[3];
+    /* --- y16~47：32x32 大号状态；告警时整条反色闪烁（2Hz）；
+     *     解除提示期间（s_hint）以单倍字号居中显示提示词 --- */
+    if (s_hint[0] != '\0') {
+        const char *p = s_hint;
+        uint8_t n = 0, x;
+        while (*p != '\0') {
+            if ((uint8_t)*p >= 0x80u) { p += 3; n++; }
+            else                      { p += 1; }
+        }
+        x = (uint8_t)((s_draw_w - n * CJK16_W) / 2u);
+        oled_draw_text(3, x, s_hint);          /* 单倍字号，pages 3~4 */
     } else {
-        st  = ((uint8_t)s->state < 4u) ? (uint8_t)s->state : 0u;
-        big = STATE_TXT[st];
+        if (s->alarm) {
+            s_blink   = !s_blink;          /* 每次刷新翻转 -> 250ms 刷新时为 2Hz */
+            blink_inv = s_blink;
+            big       = STATE_TXT[3];
+        } else {
+            st  = ((uint8_t)s->state < 4u) ? (uint8_t)s->state : 0u;
+            big = STATE_TXT[st];
+        }
+        if (blink_inv) {
+            /* 反色阶段：先把 4 页铺成实底，再清出笔画 -> 白底黑字 */
+            oled_fill_page(OLED_BIG_PAGE + 0u, 0xFF);
+            oled_fill_page(OLED_BIG_PAGE + 1u, 0xFF);
+            oled_fill_page(OLED_BIG_PAGE + 2u, 0xFF);
+            oled_fill_page(OLED_BIG_PAGE + 3u, 0xFF);
+        }
+        oled_draw_big_text(OLED_BIG_PAGE, big, blink_inv);
     }
-    if (blink_inv) {
-        /* 反色阶段：先把 4 页铺成实底，再清出笔画 -> 白底黑字 */
-        oled_fill_page(OLED_BIG_PAGE + 0u, 0xFF);
-        oled_fill_page(OLED_BIG_PAGE + 1u, 0xFF);
-        oled_fill_page(OLED_BIG_PAGE + 2u, 0xFF);
-        oled_fill_page(OLED_BIG_PAGE + 3u, 0xFF);
+
+    /* --- y48~63：硬件接入状态区（中文，异常必须讲清原因）
+     *   全部正常：page6「接入正常」+ page7「全部设备已就绪」（居中不滚动）
+     *   有异常  ：page6 具体原因（滚动）+ page7 处置建议（滚动）
+     * 收包计数与 SD 统计已移到 P2 系统页。 --- */
+    {
+        static int16_t s_off6 = 0, s_off7 = 0;
+        bool  bad_udp  = !s->data_fresh;
+        bool  bad_fpga = !s->fpga_ok;
+        bool  bad_ui   = !s->ui_alive;
+        bool  bad_sd   = !s->sd_ok;
+        uint8_t nbad = (uint8_t)((bad_udp ? 1u : 0u) + (bad_fpga ? 1u : 0u) +
+                                 (bad_ui ? 1u : 0u) + (bad_sd ? 1u : 0u));
+
+        if (s->alarm && s->has_impact) {
+            goto status_rows_done;
+        }
+
+        if (nbad == 0u) {
+            s_off6 = s_off7 = 0;
+            oled_draw_text(6, (uint8_t)((s_draw_w - 4u * CJK16_W) / 2u),
+                           "全部正常");
+            oled_draw_text(7, (uint8_t)((s_draw_w - 5u * CJK16_W) / 2u),
+                           "设备就绪");
+        } else {
+            /* 两行滚动：上行=哪个设备坏了，下行=怎么办 */
+            char reason[64];
+            char advice[64];
+
+            /* 文案规则：只用中文与竖杠「丨」，不使用任何其它标点，
+             * 不使用 ASCII（ASCII 只占 8 行高，与 16 行中文字模不匹配）。 */
+            reason[0] = '\0';
+            advice[0] = '\0';
+            if (bad_udp) {
+                strncat(reason, "穿戴端无数据",
+                        sizeof(reason) - strlen(reason) - 1u);
+                strncat(advice, "查穿戴端电源",
+                        sizeof(advice) - strlen(advice) - 1u);
+            }
+            if (bad_fpga) {
+                cat_sep(reason, sizeof(reason), "串口断开");
+                cat_sep(advice, sizeof(advice), "查两板连线");
+            }
+            if (bad_ui) {
+                cat_sep(reason, sizeof(reason), "键盘未连接");
+                cat_sep(advice, sizeof(advice), "查键盘排线");
+            }
+            if (bad_sd) {
+                cat_sep(reason, sizeof(reason), "存储卡未插入");
+                cat_sep(advice, sizeof(advice), "插好卡后上电");
+            }
+
+            s_off6 = marquee_next(s_off6, reason);
+            marquee_cjk(6, s_off6, reason);
+            s_off7 = marquee_next(s_off7, advice);
+            marquee_cjk(7, s_off7, advice);
+        }
+
+status_rows_done:
+        if (s->alarm && s->has_impact) {
+            /* 数字/小数点/g 已收录为 16x16 全高字模（由 5x7 ASCII 放大而来），
+             * 因此可与中文同高混排，"3.40g" 保持可读格式。 */
+            snprintf(row, sizeof(row), "冲击%u.%02ug",
+                     (unsigned)(s->impact_mag_x100 / 100u),
+                     (unsigned)(s->impact_mag_x100 % 100u));
+            oled_draw_text(6, 0, row);
+            if (s->alarm_start_ms != 0u) {
+                int64_t now_ms = esp_timer_get_time() / 1000LL;
+                int64_t dur = now_ms - (int64_t)s->alarm_start_ms;
+                if (dur < 0) dur = 0;
+                snprintf(row, sizeof(row), "已持续%lu秒%s",
+                         (unsigned long)(dur / 1000LL),
+                         s->mute_effective ? "丨静音中" : "");
+            } else {
+                snprintf(row, sizeof(row), "%s",
+                         s->mute_effective ? "静音中" : "");
+            }
+            oled_draw_text(7, 0, row);
+        }
     }
-    oled_draw_big_text(OLED_BIG_PAGE, big, blink_inv);
-
-    /* --- y48~55：收包活性 --- */
-    snprintf(row, sizeof(row), "PKT %lu SEQ %u",
-             (unsigned long)s->packets, (unsigned)s->last_seq);
-    oled_draw_row(6, row);
-
-    /* --- y56~63：存储 / 链路 / 质量计数 --- */
-    snprintf(row, sizeof(row), "SD:%s F:%s %lu/%lu",
-             s->sd_ok ? "OK" : "--", s->fpga_ok ? "OK" : "--",
-             (unsigned long)s->frames_bad, (unsigned long)s->sd_dropped);
-    oled_draw_row(7, row);
 
     return oled_flush();
+}
+
+/* ==========================================================================
+ * 多页面扩展（P1 遥测 / P2 系统 / P3 设置 / P4 演示）
+ *
+ * 全部复用既有绘制原语（页寻址差量刷新、CJK 混排、反色高亮），
+ * 新增字模见 font_cjk16.h（冲击/设置/演示模式/场景/静止/灯/自检/剧本/
+ * 遥测(遥)/系统(系统)/解除 等，由 tools/font_gen/gen_cjk16.ps1 生成）。
+ * ========================================================================== */
+
+/* 运行期设置面板对比度（0x81 命令） */
+esp_err_t oled_set_contrast(uint8_t val)
+{
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return oled_tx_cmd2(0x81u, val);
+}
+
+/* 带符号定点（0.01g 或 0.1dps）-> "+N.NN" / "-N.N" 文本 */
+static void fmt_q(char *buf, size_t len, int32_t v, int32_t scale)
+{
+    int32_t a = (v < 0) ? -v : v;
+    snprintf(buf, len, "%s%ld.%02ld", (v < 0) ? "-" : "+",
+             (long)(a / scale), (long)(a % scale));
+}
+
+/* P1 遥测页 */
+void oled_show_telemetry(const oled_status_t *s,
+                         const uint8_t *mag_hist, uint8_t hist_n)
+{
+    char   row[24];
+    char   q[12];
+    uint8_t i;
+    int     fresh = (int)s->data_fresh;
+
+    oled_clear();
+
+    /* 反色标题栏「遥测」+ 页码 */
+    draw_title(0, "遥测", 2);
+
+    /* 合加速度幅值 + 状态（数据流停摆显示 --，与 FPGA 侧 3s 老化同语义） */
+    if (fresh) {
+        snprintf(row, sizeof(row), "a=%2u.%02ug %s",
+                 (unsigned)(s->mag_x100 / 100u),
+                 (unsigned)(s->mag_x100 % 100u),
+                 fall_state_name(s->state));
+    } else {
+        snprintf(row, sizeof(row), "a= --    %s",
+                 fall_state_name(s->state));
+    }
+    oled_draw_row(2, row);
+
+    /* 三轴加速度（原始值 -> 0.01g） */
+    if (fresh) {
+        fmt_q(q, sizeof(q), ((int32_t)s->acc[0] * 100) / 2048, 100);
+        snprintf(row, sizeof(row), "X%s ", q);
+    } else {
+        snprintf(row, sizeof(row), "X --");
+    }
+    oled_draw_row(3, row);
+    if (fresh) {
+        fmt_q(q, sizeof(q), ((int32_t)s->acc[1] * 100) / 2048, 100);
+        snprintf(row, sizeof(row), "Y%s ", q);
+    } else {
+        snprintf(row, sizeof(row), "Y --");
+    }
+    oled_draw_row(4, row);
+
+    /* 角速度合成（0.1dps）：|w| = isqrt(gx^2+gy^2+gz^2) 整数开方 */
+    if (fresh) {
+        int32_t gx = s->gyro[0], gy = s->gyro[1], gz = s->gyro[2];
+        int32_t g2 = gx * gx + gy * gy + gz * gz;
+        int32_t r = 0, bit = 1 << 30;
+        int32_t wx;
+        while (bit > g2) bit >>= 2;
+        while (bit != 0) {
+            if (g2 >= r + bit) { g2 -= r + bit; r = (r >> 1) + bit; }
+            else               { r >>= 1; }
+            bit >>= 2;
+        }
+        wx = (int32_t)(((int64_t)r * 10000L) / 16384L);   /* 0.1dps */
+        snprintf(row, sizeof(row), "w=%ld.%01lddps BAD %lu",
+                 (long)(wx / 10), (long)(wx % 10),
+                 (unsigned long)s->frames_bad);
+    } else {
+        snprintf(row, sizeof(row), "w= --      BAD %lu",
+                 (unsigned long)s->frames_bad);
+    }
+    oled_draw_row(5, row);
+
+    /* 帧率 + 序号 */
+    snprintf(row, sizeof(row), "FPS %u.%u  SEQ %u",
+             (unsigned)(s->fps_x10 / 10u), (unsigned)(s->fps_x10 % 10u),
+             (unsigned)s->last_seq);
+    oled_draw_row(6, row);
+
+    /* 幅值历史条形图（2 页 16px 高，末元素最右柱）；停摆期已由 ui 清零 */
+    if (mag_hist != NULL && hist_n > 0) {
+        for (i = 0; i < hist_n && i < s_draw_w; i++) {
+            uint8_t lvl = mag_hist[hist_n - 1u - i];
+            uint8_t x   = (uint8_t)(s_draw_w - 1u - i);
+            uint8_t h   = (uint8_t)(lvl * 16u / 15u);
+            uint8_t mask_top    = (h <= 8u) ? 0x00 : (uint8_t)(0xFFu << (16u - h));
+            uint8_t mask_bottom = (h >= 8u) ? 0xFF : (uint8_t)((1u << h) - 1u);
+            s_fb[4][x] = mask_top;
+            s_fb[5][x] = mask_bottom;
+        }
+    }
+
+    (void)oled_flush();
+}
+
+/* P2 系统页 */
+void oled_show_system(const oled_status_t *s, const char *ssid, int channel)
+{
+    char row[40];
+    int64_t up_s = esp_timer_get_time() / 1000000LL;
+
+    oled_clear();
+
+    draw_title(0, "系统", 3);
+
+    /* 每行都走自适应：放得下静态显示，放不下自动横向滚动 */
+    static int16_t o2 = 0, o3 = 0, o4 = 0, o5 = 0, o6 = 0, o7 = 0;
+
+    snprintf(row, sizeof(row), "IP192.168.4.1 CH%d", channel);
+    draw_row_autoscroll(2, &o2, row);
+
+    snprintf(row, sizeof(row), "UP %02ld:%02ld:%02lu %s",
+             (long)((up_s / 3600) % 100), (long)((up_s / 60) % 60),
+             (unsigned long)(up_s % 60), ssid);
+    draw_row_autoscroll(3, &o3, row);
+
+    snprintf(row, sizeof(row), "SD %s DROP %lu",
+             s->sd_file, (unsigned long)s->sd_dropped);
+    draw_row_autoscroll(4, &o4, row);
+
+    snprintf(row, sizeof(row), "BAD %lu FPGA %s UI %s",
+             (unsigned long)s->frames_bad,
+             s->fpga_ok ? "OK" : "--", s->ui_alive ? "OK" : "--");
+    draw_row_autoscroll(5, &o5, row);
+
+    snprintf(row, sizeof(row), "LINK %s SEQ %u",
+             s->data_fresh ? "OK" : "--", (unsigned)s->last_seq);
+    draw_row_autoscroll(6, &o6, row);
+
+    snprintf(row, sizeof(row), "PKT %lu SD %s",
+             (unsigned long)s->packets, s->sd_ok ? "OK" : "--");
+    draw_row_autoscroll(7, &o7, row);
+
+    (void)oled_flush();
+}
+
+/* P3 设置页 */
+void oled_show_settings(uint8_t cursor)
+{
+    char row[40];
+    char name[16], val[12];
+    uint8_t start, r, item;
+
+    if (cursor >= SETTINGS_ITEM_N) {
+        cursor = 0;
+    }
+    start = (cursor >= 5u) ? (uint8_t)(cursor - 4u) : 0u;
+
+    oled_clear();
+
+    draw_title(0, "设置", 4);
+
+    for (r = 0; r < 5; r++) {
+        item = (uint8_t)(start + r);
+        if (item >= SETTINGS_ITEM_N) {
+            break;
+        }
+        settings_get_item_text(item, name, sizeof(name), val, sizeof(val));
+        snprintf(row, sizeof(row), "%u %-9s %s",
+                 (unsigned)(item + 1u), name, val);
+        if (item == cursor) {
+            oled_fill_page(2u + r, 0xFF);
+            oled_draw_text_inv(2u + r, 0, row);
+        } else {
+            oled_draw_row(2u + r, row);
+        }
+    }
+
+    /* 键位提示：KEY0/1 移光标、KEY2/3 调值、KEY14 退出 */
+    oled_draw_row(7, "K0/K1 sel  K2/K3 +/-  K14 exit");
+    (void)oled_flush();
+}
+
+/* P4 演示页：英文紧凑行（每行占 1 页，ASCII 6x8 不跨页，绝不重叠）。
+ *
+ * 版面：page0~1 反色标题「演示模式」+ 页码；page2 场景编号与名称；
+ *       page3 该场景动作；page4 声光表现；page5 剧本进度；page7 按键提示。
+ *
+ * 为什么这里用英文：16x16 中文字模高 16 行 = 2 页，相邻两行必须隔一页
+ * 才能不重叠；演示页信息行多（5 行），中文只能塞 3 行且极易叠字。
+ * 因此正文用英文短句（表意清楚、非缩写），标题仍用中文。
+ *
+ * demo_active=false（拨码 SW1 未开）时显示开启指引。 */
+void oled_show_demo(uint8_t scene, int script_step, const char *script_name,
+                    bool demo_mute, bool demo_active)
+{
+    static const char *const k_scene[8] = {
+        "Script", "Idle", "Walk", "Pending",
+        "Fall Alarm", "LED Walk", "Self Test", "Reserved"
+    };
+    static const char *const k_act[8] = {
+        "Auto demo: full sequence",
+        "Simulate standing still",
+        "Simulate walking",
+        "Simulate impact, wait",
+        "Simulate fall alarm",
+        "Light LEDs one by one",
+        "Check display & buzzer",
+        "Not used"
+    };
+    static const char *const k_fx[8] = {
+        "SEG scroll, LED flow",
+        "SEG ready, LED breathe",
+        "SEG run, LED ring flow",
+        "SEG value flash, LED scan",
+        "SEG alarm, all strobe",
+        "SEG count, single LED",
+        "Glyphs sweep, 3 tones",
+        "Not used"
+    };
+    char row[40];
+
+    if (scene >= 8u) {
+        scene = 0u;
+    }
+
+    oled_clear();
+
+    draw_title(0, "演示模式", 5);
+
+    if (!demo_active) {
+        oled_draw_text(2, 0, "拨码一开启演示");
+        oled_draw_row(4, "SW1=ON  -> demo");
+        oled_draw_row(5, "KEY0-7  select scene");
+        oled_draw_row(6, "KEY8 next, KEY9/10");
+        oled_draw_row(7, "SW1=OFF -> exit");
+        (void)oled_flush();
+        return;
+    }
+
+    /* 场景编号 + 名称（ASCII 单页） */
+    snprintf(row, sizeof(row), "Scene %u: %s",
+             (unsigned)scene, k_scene[scene]);
+    oled_draw_row(2, row);
+
+    /* 该场景在做什么 / 声光表现：长句自动滚动，避免右侧超出显示区 */
+    static int16_t oa = 0, of = 0, ok = 0;
+    draw_row_autoscroll(3, &oa, k_act[scene]);
+    draw_row_autoscroll(4, &of, k_fx[scene]);
+
+    /* 剧本进度（场景 0） */
+    if (scene == 0u) {
+        if (script_step >= 0) {
+            snprintf(row, sizeof(row), "Step %d of 5", script_step + 1);
+        } else {
+            snprintf(row, sizeof(row), "Step - (not started)");
+        }
+        oled_draw_row(5, row);
+    }
+
+    /* 按键提示 */
+    snprintf(row, sizeof(row), "%sKEY0-7 sel, KEY8 next",
+             demo_mute ? "MUTE | " : "");
+    draw_row_autoscroll(7, &ok, row);
+
+    (void)oled_flush();
 }
