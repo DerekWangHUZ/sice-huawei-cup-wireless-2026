@@ -78,3 +78,10 @@ Thumbs.db
 *.mov
 *.zip
 *.tar.gz
+
+# 本地编译产物与临时脚本（不提交）
+.tmp_build/
+.tmp_*.ps1
+.tmp_*.py
+.tmp_camtest/
+.tmp_tmbuild/

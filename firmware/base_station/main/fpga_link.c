@@ -114,7 +114,15 @@ esp_err_t fpga_link_send_cmd_ex(uint8_t cmd, uint8_t p1, uint16_t p2, bool verbo
     if (s_tx_mtx == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    xSemaphoreTake(s_tx_mtx, portMAX_DELAY);
+    /*
+     * 用有限等待而非 portMAX_DELAY：若持锁任务异常卡住（例如 UART 驱动
+     * 阻塞），无限等待会让所有 FPGA 发送永久挂起，告警帧发不出去。
+     * 200ms 足够覆盖正常竞争（一帧 8 字节 @115200 约 0.7ms），
+     * 超时则放弃本帧——告警语义由状态机重发兜底。
+     */
+    if (xSemaphoreTake(s_tx_mtx, pdMS_TO_TICKS(200)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
 
     /* 帧间隔保护：不足则忙等补足（8 字节 @115200 约 0.7ms，等待极短）。
      * 忙等在互斥量内进行，保证多任务并发下帧间隔仍然成立。 */

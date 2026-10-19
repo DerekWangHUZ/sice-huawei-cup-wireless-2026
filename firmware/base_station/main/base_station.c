@@ -49,6 +49,7 @@
 
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
+#include <sys/poll.h>          /* poll()：UDP 收包超时（SO_RCVTIMEO 本构建不生效） */
 #include "dhcpserver/dhcpserver.h"   /* dhcps_lease_t（DHCP 地址池） */
 
 #include "board_pins.h"
@@ -284,21 +285,39 @@ static void wifi_init_softap(void)
 
     /*
      * DHCP 地址池避开 192.168.4.2（契约 §1.1 归穿戴端静态地址）。
-     * 否则后接入的电脑可能先拿到 .2，导致抓拍指令发错设备。
-     * 失败只告警：地址池维持默认，不影响收包主链路。
+     * 否则后接入的电脑会先拿到 .2，导致：
+     *   - 抓拍指令发错设备
+     *   - 电脑访问 http://192.168.4.2/ 时实际访问自己（网页打不开）
+     *
+     * 时序要点：esp_wifi_start() 内部已经拉起 dhcps，所以必须先
+     * dhcps_stop -> 写地址池 -> dhcps_start 才会被真正读取。
+     * 只在 wifi_start 之前写是不生效的（wifi_start 会重新初始化 dhcps）。
      */
     {
         dhcps_lease_t lease;
+        esp_err_t derr;
+
         memset(&lease, 0, sizeof(lease));
-        lease.enable      = true;
+        lease.enable        = true;
         lease.start_ip.addr = htonl(0xC0A8040A);   /* 192.168.4.10 */
         lease.end_ip.addr   = htonl(0xC0A80464);   /* 192.168.4.100 */
-        err = esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET,
-                                     ESP_NETIF_REQUESTED_IP_ADDRESS,
-                                     &lease, sizeof(lease));
-        if (err != ESP_OK) {
+
+        derr = esp_netif_dhcps_stop(ap_netif);
+        if (derr != ESP_OK) {
+            ESP_LOGW(TAG, "dhcps stop: %s", esp_err_to_name(derr));
+        }
+        derr = esp_netif_dhcps_option(ap_netif, ESP_NETIF_OP_SET,
+                                      ESP_NETIF_REQUESTED_IP_ADDRESS,
+                                      &lease, sizeof(lease));
+        if (derr != ESP_OK) {
             ESP_LOGW(TAG, "dhcps lease option failed: %s (keep default pool)",
-                     esp_err_to_name(err));
+                     esp_err_to_name(derr));
+        }
+        derr = esp_netif_dhcps_start(ap_netif);
+        if (derr != ESP_OK) {
+            ESP_LOGW(TAG, "dhcps restart: %s", esp_err_to_name(derr));
+        } else {
+            ESP_LOGI(TAG, "dhcp pool: 192.168.4.10 - 192.168.4.100 (.2 reserved)");
         }
     }
 
@@ -450,19 +469,17 @@ static void udp_pose_task(void *arg)
     ESP_LOGI(TAG, "UDP listening on :%d", UDP_PORT_POSE);
 
     /*
-     * 收包超时 100ms：数据流停摆时任务也要周期醒来跑 fall_detector_tick，
-     * 保证告警超时解除/掉线保护不依赖"下一帧到达"（实测缺陷修复）。
+     * 收包超时：数据流停摆时任务也要周期醒来跑 fall_detector_tick，
+     * 保证告警超时解除、掉线保护、1Hz 遥测刷新不依赖"下一帧到达"。
      *
-     * 2026-10-18 实测注记（未改代码，仅记录）：本 IDF 构建下该超时实测**不生效**
-     * ——25s 无数据时该分支一次都没跑过（真机日志只在"下一帧到达"时才判定掉线，
-     * 与设计的 3s 超时不符）。曾试用 select() 显式超时替代，实机表现相同，
-     * 因无法在无数据场景下验证而**回退**，以免改动已实测通过的主链路。
-     * 影响范围：仅"完全没有数据到达"时的空闲路径（掉线保护 tick、遥测哨兵）。
-     * 数码管读数不会因此显示过期值——FPGA 侧已自行做 3s 遥测老化（见
-     * rtl/seg_display.v 的 TELEM_STALE_DIV），不依赖 S3 的这条路径。
+     * 不用 SO_RCVTIMEO：本 IDF 构建下实测该选项对 recvfrom 不生效，
+     * 无数据时任务会永久阻塞，导致 fall_detector_tick / fpga_telemetry_tick
+     * / status_publish 全部停摆（OLED 冻结、遥测不刷新、告警超时失效）。
+     *
+     * 改用 poll() 显式等待：每 100ms 返回一次，无数据走空闲路径。
+     * 这是阻塞式 recvfrom 唯一可靠的超时手段。
      */
-    struct timeval rx_timeout = { .tv_sec = 0, .tv_usec = 100 * 1000 };
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rx_timeout, sizeof(rx_timeout));
+    const int RX_POLL_TIMEOUT_MS = 100;
 
     fall_detector_t det;
     fall_detector_init(&det);
@@ -486,7 +503,24 @@ static void udp_pose_task(void *arg)
     uint8_t rxbuf[128];
 
     while (1) {
-        int len = recvfrom(sock, rxbuf, sizeof(rxbuf), 0, NULL, NULL);
+        /*
+         * 先 poll 再收：poll 超时返回 0 时走"无数据"分支，
+         * 保证 tick/遥测/状态发布按 100ms 节拍推进。
+         * POLLIN 就绪后再 recvfrom 必然立即返回，不会阻塞。
+         */
+        struct pollfd pfd;
+        pfd.fd      = sock;
+        pfd.events  = POLLIN;
+        pfd.revents = 0;
+
+        int pr = poll(&pfd, 1, RX_POLL_TIMEOUT_MS);
+        int len = 0;
+        if (pr > 0 && (pfd.revents & POLLIN) != 0) {
+            len = (int)recvfrom(sock, rxbuf, sizeof(rxbuf), 0, NULL, NULL);
+            if (len < 0) {
+                len = 0;      /* 读出错按无数据处理，避免 errno 分支打断节拍 */
+            }
+        }
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
 
         if (len <= 0) {
@@ -506,7 +540,12 @@ static void udp_pose_task(void *arg)
 #if ENABLE_OLED
             status_publish(&det, last_seq);
 #endif
-            continue;
+            /*
+             * 空闲时也要走统计打印：若在此直接 continue，
+             * 「穿戴端断线」时 STATS 一行都不输出，无法从日志判断
+             * 收包任务是否还在跑。因此跳转到统计段再回循环头。
+             */
+            goto stats_tick;
         }
         g_packets++;
 
@@ -594,6 +633,7 @@ static void udp_pose_task(void *arg)
         /* 1Hz 遥测刷新：让 FPGA 数码管读数持续反映实时合加速度（契约 §4.5） */
         fpga_telemetry_tick(&det, last_mag_x100, true, now_ms, &last_tel_ms);
 
+stats_tick:
         /* 周期统计（原始日志，供验收查） */
         if (last_stats_ms == 0) {
             last_stats_ms = now_ms;

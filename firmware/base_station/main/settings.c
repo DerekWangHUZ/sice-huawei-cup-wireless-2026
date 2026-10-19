@@ -97,15 +97,25 @@ static void settings_save(void)
     if (nvs_open("ui", NVS_READWRITE, &h) != ESP_OK) {
         return;
     }
-    nvs_set_u8(h, "contrast", s_cfg.contrast);
-    nvs_set_u8(h, "pageauto", s_cfg.page_auto);
-    nvs_set_u16(h, "cyclems", s_cfg.cycle_ms);
-    nvs_set_u16(h, "telms", s_cfg.tel_ms);
-    nvs_set_u8(h, "pendb", s_cfg.pend_beep);
-    nvs_set_u8(h, "buzen", s_cfg.buzzer_en);
-    nvs_set_u8(h, "tonesel", s_cfg.tone_sel);
-    nvs_set_u8(h, "xshift", s_cfg.x_shift);
-    nvs_commit(h);
+    /*
+     * 逐项写入并检查返回值：NVS 空间不足或 flash 异常时若静默失败，
+     * 表现为"设置改了但下次上电又回到旧值"，很难排查。
+     */
+    esp_err_t e = ESP_OK;
+    e = (e != ESP_OK) ? e : nvs_set_u8(h, "contrast", s_cfg.contrast);
+    e = (e != ESP_OK) ? e : nvs_set_u8(h, "pageauto", s_cfg.page_auto);
+    e = (e != ESP_OK) ? e : nvs_set_u16(h, "cyclems", s_cfg.cycle_ms);
+    e = (e != ESP_OK) ? e : nvs_set_u16(h, "telms", s_cfg.tel_ms);
+    e = (e != ESP_OK) ? e : nvs_set_u8(h, "pendb", s_cfg.pend_beep);
+    e = (e != ESP_OK) ? e : nvs_set_u8(h, "buzen", s_cfg.buzzer_en);
+    e = (e != ESP_OK) ? e : nvs_set_u8(h, "tonesel", s_cfg.tone_sel);
+    e = (e != ESP_OK) ? e : nvs_set_u8(h, "xshift", s_cfg.x_shift);
+    if (e == ESP_OK) {
+        e = nvs_commit(h);
+    }
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "settings save failed: %s", esp_err_to_name(e));
+    }
     nvs_close(h);
 }
 

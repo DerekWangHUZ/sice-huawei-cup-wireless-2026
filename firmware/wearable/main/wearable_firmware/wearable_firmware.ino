@@ -50,6 +50,18 @@ SemaphoreHandle_t captureDoneSemaphore = nullptr;
 TaskHandle_t captureTaskHandle = nullptr;
 bool cameraReady = false;
 bool commandPortReady = false;
+
+/*
+ * 抓拍链路诊断计数（供 /status 查询，不依赖串口）：
+ *   cmdRx    收到并通过校验的抓拍命令数
+ *   rejected requestCapture 因未就绪/忙而拒绝的次数
+ *   ok       成功存入 PSRAM 的照片数
+ *   fail     取帧或分配内存失败的次数
+ */
+volatile uint32_t g_captureCmdRx  = 0;
+volatile uint32_t g_captureReject = 0;
+volatile uint32_t g_captureOk     = 0;
+volatile uint32_t g_captureFail   = 0;
 bool captureBusy = false;
 bool captureWaitingForLight = false;
 unsigned long captureLightReadyTime = 0;
@@ -157,9 +169,15 @@ void sendImuPacket(
   // Byte 17：帧尾
   packet[17] = 0x0D;
 
-  udp.beginPacket(receiverIP, receiverPort);
-  udp.write(packet, sizeof(packet));
-  udp.endPacket();
+  /*
+   * UDP 无连接，丢一帧由基站掉线保护兜底，不必重发。
+   * 但 beginPacket 在 socket 未就绪时返回 0，此时继续 write/endPacket
+   * 无意义且会掩盖故障，因此判一下。
+   */
+  if (udp.beginPacket(receiverIP, receiverPort) != 0) {
+    udp.write(packet, sizeof(packet));
+    udp.endPacket();
+  }
 
   packetSequence++;
 }
@@ -168,6 +186,12 @@ bool setupMpu() {
   // SDA=IO14，SCL=IO15，速度100kHz
   startupStep("MPU: I2C0 begin ENTER (SDA=14, SCL=15)");
   bool busStarted = MPUWire.begin(14, 15, 100000);
+  /*
+   * I2C 超时保护：MPU 掉线或杜邦线松动时，Wire 会在 SDA 被拉低时长时间
+   * 等待，把主循环的 50Hz 采样拖死（表现为数据停发、串口无输出）。
+   * 设 50ms 上限，让读写快速失败返回 false，上层跳过本次采样。
+   */
+  MPUWire.setTimeOut(50);
   startupStep(busStarted ? "MPU: I2C0 begin RETURN true"
                          : "MPU: I2C0 begin RETURN false");
   if (!busStarted) {
@@ -376,11 +400,24 @@ void updateCaptureFlash() {
 }
 
 bool captureAndStorePhoto() {
-  // 仅由captureWorker调用。开灯预热已由主循环的状态机完成。
-  camera_fb_t *fb = esp_camera_fb_get();
+  /*
+   * 仅由 captureWorker 调用。开灯预热已由主循环的状态机完成。
+   *
+   * 与 /stream 的竞争：网页视频流会在 handler 里持续 esp_camera_fb_get()，
+   * 同一时刻再取帧可能拿到 NULL。抓拍不追求帧率，重试 3 次（间隔 100ms）
+   * 让出一个帧周期即可，仍失败才放弃。
+   */
+  camera_fb_t *fb = NULL;
+  for (int attempt = 0; attempt < 3 && fb == NULL; attempt++) {
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      delay(100);
+    }
+  }
 
   if (!fb) {
-    Serial.println("抓拍失败：摄像头没有返回图像");
+    g_captureFail++;
+    Serial.println("抓拍失败：摄像头没有返回图像（可能被视频流占用）");
     return false;
   }
 
@@ -395,6 +432,7 @@ bool captureAndStorePhoto() {
   }
 
   if (!newPhoto) {
+    g_captureFail++;
     Serial.println("抓拍失败：没有足够内存");
     esp_camera_fb_return(fb);
     return false;
@@ -407,6 +445,7 @@ bool captureAndStorePhoto() {
   if (!latestPhotoMutex ||
       xSemaphoreTake(latestPhotoMutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
     free(newPhoto);
+    g_captureFail++;
     Serial.println("抓拍失败：照片缓冲区正忙");
     return false;
   }
@@ -421,6 +460,7 @@ bool captureAndStorePhoto() {
   }
 
   captureSequence++;
+  g_captureOk++;
   Serial.printf("抓拍成功 #%lu：%u 字节，可打开 /pic 查看\n",
                 (unsigned long)captureSequence,
                 (unsigned int)newPhotoLen);
@@ -431,9 +471,15 @@ bool captureAndStorePhoto() {
 void captureWorker(void *parameter) {
   (void)parameter;
   for (;;) {
+    if (captureRequestSemaphore == nullptr) {
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
     if (xSemaphoreTake(captureRequestSemaphore, portMAX_DELAY) == pdTRUE) {
       captureAndStorePhoto();
-      xSemaphoreGive(captureDoneSemaphore);
+      if (captureDoneSemaphore != nullptr) {
+        xSemaphoreGive(captureDoneSemaphore);
+      }
     }
   }
 }
@@ -441,10 +487,12 @@ void captureWorker(void *parameter) {
 void requestCapture() {
   // 以下状态和闪光灯只由主循环修改，工作任务只通过信号量通信。
   if (!cameraReady || !captureTaskHandle) {
-    Serial.println("抓拍不可用：摄像头或工作任务未就绪");
+    g_captureReject++;
+    Serial.println("抓拍不可用：摄像头未就绪或工作任务未创建");
     return;
   }
   if (captureBusy) {
+    g_captureReject++;
     Serial.println("抓拍忙：本次命令未执行，请稍后重试");
     return;
   }
@@ -467,7 +515,8 @@ void serviceCapture() {
   if (captureBusy && captureWaitingForLight &&
       (int32_t)(millis() - captureLightReadyTime) >= 0) {
     captureWaitingForLight = false;
-    if (xSemaphoreGive(captureRequestSemaphore) != pdTRUE) {
+    if (captureRequestSemaphore == nullptr ||
+        xSemaphoreGive(captureRequestSemaphore) != pdTRUE) {
       captureBusy = false;
       Serial.println("抓拍失败：无法提交工作任务");
     }
@@ -492,9 +541,14 @@ void checkCaptureCommand() {
     uint8_t command[4] = {0};
     int received = udp.read(command, sizeof(command));
 
-    // 丢弃当前UDP报文中超出4字节的剩余内容。
-    while (udp.available()) {
-      udp.read();
+    /*
+     * 丢弃当前报文的剩余字节。加计数上限：udp.available() 在报文读完后
+     * 仍可能因内部状态返回非 0，无界 while 会卡住主循环、拖慢 MPU 采样。
+     */
+    int guard = 0;
+    while (udp.available() > 0 && guard < 64) {
+      (void)udp.read();
+      guard++;
     }
 
     bool validCommand =
@@ -506,6 +560,7 @@ void checkCaptureCommand() {
         command[3] == 0xFF;
 
     if (validCommand) {
+      g_captureCmdRx++;
       Serial.print("收到抓拍命令，来源：");
       Serial.print(udp.remoteIP());
       Serial.print(":");
@@ -529,6 +584,27 @@ void setup() {
   Serial.println();
   Serial.println("[BOOT] wearable_firmware: static IP + async capture");
   Serial.flush();
+
+  /*
+   * 关闭 brownout 检测器。
+   *
+   * 现象：射频上电瞬间（WiFi.mode 之后）电压瞬时跌落，检测器判定掉电并
+   * 复位芯片，形成「启动→到 WiFi.mode→复位」的无限循环，基站侧永远
+   * 收不到数据。
+   *
+   * 权衡：检测器本意是电压真崩时保护芯片，但在供电刚好处于临界点时
+   * 它会让设备完全无法启动，比"电压真崩时死机"更糟。
+   *
+   * 地址推导（ESP32，非 S3）：
+   *   RTC_CNTL_BROWN_OUT_REG = DR_REG_RTCCNTL_BASE + 0xd4
+   *   DR_REG_RTCCNTL_BASE    = 0x3ff48000
+   *   => 0x3ff480d4
+   * 不用 WRITE_PERI_REG + soc 头文件，避免引入额外寄存器定义影响摄像头。
+   */
+  {
+    volatile uint32_t *brown_out_reg = (volatile uint32_t *)0x3ff480d4u;
+    *brown_out_reg = 0u;
+  }
 
   latestPhotoMutex = xSemaphoreCreateMutex();
 
@@ -562,7 +638,12 @@ void setup() {
   config.pin_reset = RESET_GPIO_NUM;
 
   config.xclk_freq_hz = 20000000;
-  config.frame_size = FRAMESIZE_UXGA;
+  /*
+   * 初始分辨率直接给 QVGA（320x240）。
+   * 用最终分辨率直接初始化，避免先按大分辨率分配缓冲再缩水的浪费：
+   * 既省 PSRAM，也缩短初始化时间。
+   */
+  config.frame_size = FRAMESIZE_QVGA;
   config.pixel_format = PIXFORMAT_JPEG;
 
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
@@ -572,9 +653,21 @@ void setup() {
 
   if (config.pixel_format == PIXFORMAT_JPEG) {
     if (psramFound()) {
+      /*
+       * 有 PSRAM：给足帧缓冲。
+       *
+       * fb_count 直接决定 /stream 能否连续出帧：httpd_resp_send_chunk 是
+       * 阻塞发送，WiFi 拥塞时一帧会占着缓冲不放；只有 2 个缓冲时驱动补不上
+       * 新帧，esp_camera_fb_get() 返回 NULL，stream_handler 就会 break，
+       * 浏览器自动重连 -> 灯亮/灭反复 = 用户看到的闪光灯闪烁。
+       *
+       * QVGA JPEG 约 8KB，4 个缓冲在 PSRAM 里不到 64KB，毫无压力。
+       */
       config.jpeg_quality = 10;
-      config.fb_count = 2;
+      config.fb_count = 4;
       config.grab_mode = CAMERA_GRAB_LATEST;
+      /* 直接按实际使用的 QVGA 初始化，避免先按 UXGA 分配再降档的浪费 */
+      config.frame_size = FRAMESIZE_QVGA;
     } else {
       config.frame_size = FRAMESIZE_SVGA;
       config.fb_location = CAMERA_FB_IN_DRAM;
@@ -600,37 +693,84 @@ void setup() {
 
   if (err != ESP_OK) {
     Serial.printf("Camera init failed with error 0x%x\n", err);
-    // TODO: 摄像头失败不应中断 WiFi/UDP 初始化（见 CHANGELOG 待处理项）；本次保持现有行为
-    return;
-  }
-  cameraReady = true;
+  } else {
+    cameraReady = true;
 
-  sensor_t *s = esp_camera_sensor_get();
+    sensor_t *s = esp_camera_sensor_get();
 
-  if (s->id.PID == OV3660_PID) {
-    s->set_vflip(s, 1);
-    s->set_brightness(s, 1);
-    s->set_saturation(s, -2);
-  }
+    if (s != NULL) {
+      if (s->id.PID == OV3660_PID) {
+        s->set_vflip(s, 1);
+        s->set_brightness(s, 1);
+        s->set_saturation(s, -2);
+      }
 
-  // 默认使用低分辨率，减轻卡顿
-  if (config.pixel_format == PIXFORMAT_JPEG) {
-    s->set_framesize(s, FRAMESIZE_QVGA);
-  }
+      // 默认使用低分辨率，减轻卡顿
+      if (config.pixel_format == PIXFORMAT_JPEG) {
+        s->set_framesize(s, FRAMESIZE_QVGA);
+      }
 
 #if defined(CAMERA_MODEL_M5STACK_WIDE) || defined(CAMERA_MODEL_M5STACK_ESP32CAM)
-  s->set_vflip(s, 1);
-  s->set_hmirror(s, 1);
+      s->set_vflip(s, 1);
+      s->set_hmirror(s, 1);
 #endif
 
 #if defined(CAMERA_MODEL_ESP32S3_EYE)
-  s->set_vflip(s, 1);
+      s->set_vflip(s, 1);
 #endif
+    }
+
+    /*
+     * 摄像头自检：初始化成功后立刻试着取一帧并打印结果。
+     * 这样「初始化成功但取图失败」能直接从串口日志看出来，
+     * 不必依赖网页或切换网络。取到帧立即归还，不占内存。
+     */
+    Serial.println("[CAMERA] selftest: esp_camera_fb_get() ...");
+    Serial.flush();
+    {
+      camera_fb_t *probe = NULL;
+      for (int k = 0; k < 3 && probe == NULL; k++) {
+        probe = esp_camera_fb_get();
+        if (!probe) {
+          Serial.printf("[CAMERA] selftest attempt %d: NULL\n", k + 1);
+          Serial.flush();
+          delay(200);
+        }
+      }
+      if (probe) {
+        Serial.printf("[CAMERA] selftest OK: %u bytes, %ux%u, fmt=%d\n",
+                      (unsigned)probe->len, (unsigned)probe->width,
+                      (unsigned)probe->height, (int)probe->format);
+        Serial.flush();
+        esp_camera_fb_return(probe);
+      } else {
+        Serial.println("[CAMERA] selftest FAILED: fb_get always NULL");
+        Serial.flush();
+      }
+    }
+  }
 
 #if defined(LED_GPIO_NUM)
   startupStep("LED: setupLedFlash ENTER");
   setupLedFlash();
   startupStep("LED: setupLedFlash RETURN");
+
+  /*
+   * 闪光灯初始化后的二次自检：确认 setupLedFlash() 没有影响摄像头取图。
+   * 闪光灯用 LEDC 通道 0 之外的资源；若这里取帧失败，
+   * 说明闪光灯的初始化影响了摄像头 XCLK。
+   */
+  if (cameraReady) {
+    camera_fb_t *probe2 = esp_camera_fb_get();
+    if (probe2) {
+      Serial.printf("[CAMERA] post-LED selftest OK: %u bytes\n",
+                    (unsigned)probe2->len);
+      esp_camera_fb_return(probe2);
+    } else {
+      Serial.println("[CAMERA] post-LED selftest FAILED: LEDC conflict!");
+    }
+    Serial.flush();
+  }
 #endif
 
   // 低优先级抓拍任务运行在核0；Arduino主循环仍负责MPU的20ms采样。
@@ -660,6 +800,27 @@ void setup() {
     Serial.println("MPU没有连接，摄像头仍会继续运行");
   }
 
+  /*
+   * MPU 初始化后的摄像头自检。
+   *
+   * MPUWire 是 TwoWire(0)，与摄像头 SCCB 共用 I2C 控制器 0（引脚不同：
+   * MPU 用 GPIO14/15，SCCB 用 GPIO26/27）。若 TwoWire::begin() 重置了
+   * 整个控制器并影响 SCCB，摄像头会在这里失去响应。加一次取帧自检，
+   * 让「接上 MPU 导致摄像头失效」这种情况在串口里立刻可见，
+   * 不必等到网页报错才发现。
+   */
+  if (cameraReady) {
+    camera_fb_t *probe3 = esp_camera_fb_get();
+    if (probe3) {
+      Serial.printf("[CAMERA] post-MPU selftest OK: %u bytes\n",
+                    (unsigned)probe3->len);
+      esp_camera_fb_return(probe3);
+    } else {
+      Serial.println("[CAMERA] post-MPU selftest FAILED: I2C conflict!");
+    }
+    Serial.flush();
+  }
+
   // 连接真实基站：先启用STA，再配置固定IPv4地址，最后发起连接。
   // Wi-Fi信道由ESP32-S3 SoftAP固定为6，穿戴端跟随该基站接入。
   startupStep("WIFI: WiFi.mode ENTER");
@@ -681,25 +842,83 @@ void setup() {
 
   Serial.print("WiFi connecting");
 
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  /*
+   * 等待连接，但不无限阻塞：每 10 秒打印一次状态，每 30 秒重发一次
+   * WiFi.begin()。基站热点可能因上电顺序、信道切换或路由器重启而
+   * 暂时不可见；卡死在 while 里会让 MPU 采样与 UDP 永远不启动，
+   * 表现为基站侧「穿戴端无数据」。
+   */
+  {
+    uint32_t wait_ms  = 0;
+    uint32_t retry_ms = 0;
+
+    /*
+     * 等待上限 60 秒：超时也继续往下走，不把 setup() 永久卡死。
+     * 若一直卡在这个 while 里，MPU 采样、抓拍任务、HTTP 服务全都不会启动，
+     * 基站侧永远「穿戴端无数据」。超时后由主循环的 wifi_keepalive()
+     * 每 6 秒继续重连，连上即恢复推流。
+     */
+    const uint32_t kWaitLimitMs = 60000u;
+
+    while (WiFi.status() != WL_CONNECTED && wait_ms < kWaitLimitMs) {
+      delay(500);
+      wait_ms  += 500;
+      retry_ms += 500;
+
+      if ((wait_ms % 10000u) == 0u) {
+        Serial.printf("\n[WIFI] waiting... status=%d elapsed=%lus\n",
+                      (int)WiFi.status(), (unsigned long)(wait_ms / 1000u));
+        Serial.flush();
+      }
+      if (retry_ms >= 30000u) {
+        retry_ms = 0;
+        Serial.println("[WIFI] retry WiFi.begin()");
+        Serial.flush();
+        /*
+         * 重试时也必须重设静态 IP。
+         * WiFi.disconnect() 会清掉 dhcp/静态地址配置，只调 begin() 的话
+         * 下次连上会退回 DHCP 或根本没有地址，基站侧表现为「已连但无数据」。
+         * 顺序：disconnect -> config -> begin。
+         */
+        WiFi.disconnect(true, false);
+        delay(100);
+        if (!WiFi.config(localIP, gateway, subnet)) {
+          Serial.println("[WIFI] retry config failed");
+          Serial.flush();
+        }
+        WiFi.begin(ssid, password);
+      }
+    }
   }
 
-  Serial.println();
-  Serial.println("WiFi connected");
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.println("WiFi connected");
+  } else {
+    Serial.println();
+    Serial.println("[WIFI] not connected within 60s, continue and retry in loop");
+    Serial.flush();
+  }
   Serial.print("穿戴端静态地址：");
   Serial.println(WiFi.localIP());
   Serial.print("基站网关：");
   Serial.println(WiFi.gatewayIP());
   Serial.print("子网掩码：");
   Serial.println(WiFi.subnetMask());
+  /*
+   * 绑定抓拍命令端口。
+   *
+   * 先 stop() 再 begin()：WiFi 尚未连上时 begin() 会失败，
+   * 而失败后 socket 可能处于半开状态，后续再次 begin() 仍会失败，
+   * 导致命令端口永远收不到包（表现为抓拍不响应）。
+   * stop() 把状态清干净，重试才有意义。
+   */
+  udp.stop();
+  delay(20);
   commandPortReady = udp.begin(localUdpPort) != 0;
-  if (commandPortReady) {
-    Serial.printf("抓拍命令监听：UDP %u\n", localUdpPort);
-  } else {
-    Serial.println("UDP端口绑定失败，不能接收抓拍命令");
-  }
+  Serial.printf("抓拍命令监听：UDP %u -> %s\n", localUdpPort,
+                commandPortReady ? "OK" : "FAIL");
+  Serial.flush();
 
   Serial.print("UDP发送目标：");
   Serial.print(receiverIP);
@@ -716,12 +935,80 @@ void setup() {
   startupStep("SETUP complete; entering main loop");
 }
 
+/*
+ * 运行期 WiFi 断线自愈。
+ *
+ * 基站可能因上电顺序、重启、信道切换而短暂离线；若穿戴端在断线后
+ * 不主动重连，就会永久停留在"已连过热点但掉线"的状态，基站侧表现为
+ * 「穿戴端无数据」，只能靠人工断电重启。
+ *
+ * 策略：每 3 秒检查一次，连续 6 秒未连上就重新 WiFi.begin()；
+ * 重连成功后重新绑定 UDP 8889 命令端口（socket 可能已失效）。
+ */
+static void wifi_keepalive(void)
+{
+  static uint32_t last_check_ms = 0;
+  static uint32_t down_since_ms = 0;
+  static bool     was_connected = true;
+
+  uint32_t now = millis();
+
+  if (now - last_check_ms < 3000u) {
+    return;
+  }
+  last_check_ms = now;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!was_connected) {
+      /* 刚恢复：先 stop 再重新绑定命令端口，并刷新本地 IP 打印 */
+      udp.stop();
+      delay(20);
+      commandPortReady = udp.begin(localUdpPort) != 0;
+      Serial.printf("[WIFI] reconnected, ip=%s cmd_port=%s\n",
+                    WiFi.localIP().toString().c_str(),
+                    commandPortReady ? "OK" : "FAIL");
+      Serial.flush();
+      was_connected = true;
+    }
+    down_since_ms = 0;
+    return;
+  }
+
+  /* 掉线中 */
+  if (was_connected) {
+    was_connected  = false;
+    down_since_ms  = now;
+    Serial.println("[WIFI] link lost");
+    Serial.flush();
+  }
+
+  if (down_since_ms != 0u && (now - down_since_ms) >= 6000u) {
+    down_since_ms = now;              /* 重置计时，避免每次循环都重连 */
+    Serial.println("[WIFI] reconnect attempt");
+    Serial.flush();
+    /*
+     * 顺序：先 disconnect 让接口回到干净状态，再 config 静态地址，
+     * 最后 begin。config 必须在 disconnect 之后、begin 之前调用，
+     * 否则旧连接会让 config 返回失败、静态地址不生效。
+     */
+    WiFi.disconnect(true, false);
+    delay(50);
+    if (!WiFi.config(localIP, gateway, subnet)) {
+      Serial.println("[WIFI] config failed, retry later");
+    }
+    WiFi.begin(ssid, password);
+  }
+}
+
 void loop() {
   // 非阻塞推进闪光预热、提交抓拍和关闭闪光灯。
   serviceCapture();
 
   // 监听真实基站发往本机8889端口的4字节抓拍命令。
   checkCaptureCommand();
+
+  // WiFi 断线自愈（基站重启后自动重连，无需人工断电）
+  wifi_keepalive();
 
   // 每20毫秒读取并发送一次MPU数据，即50Hz
   if (mpuReady && millis() - lastMpuReadTime >= 20) {

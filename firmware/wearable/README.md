@@ -4,7 +4,8 @@
 > 固件入口：`main/wearable_firmware/wearable_firmware.ino`
 
 本工程是跌倒检测系统的穿戴标签端：以 50 Hz 向固定基站推送 18 字节原始 IMU 帧，
-同时提供摄像头网页与“基站触发抓拍”能力。
+摄像头当前**不可用**（硬件故障，详见第 11 节），网页视频与 `/pic` 抓拍均已停用；
+本工程实际运行的能力是 **50 Hz 姿态推流** 与 **UDP 8889 抓拍命令接收（仅记录）**。
 
 ---
 
@@ -52,8 +53,8 @@ Arduino 要求主 `.ino` 与所在文件夹同名，因此正式入口为
 | 子网掩码 | `255.255.255.0` |
 | 上行姿态数据 | 穿戴端 → `192.168.4.1:8888/UDP` |
 | 抓拍命令监听 | 穿戴端 ← `192.168.4.2:8889/UDP` |
-| 摄像头主页 | `http://192.168.4.2/` |
-| 最近抓拍照片 | `http://192.168.4.2/pic` |
+| 摄像头主页 | 不可用（摄像头故障） |
+| 最近抓拍照片 | 不可用（摄像头故障） |
 
 穿戴端以**静态地址**接入：`setup()` 中依次执行 `WiFi.mode(WIFI_STA)` →
 `WiFi.config(192.168.4.2, 192.168.4.1, 255.255.255.0)` → `WiFi.begin()`，
@@ -91,7 +92,11 @@ python tools/udp_receiver.py
 
 ---
 
-## 4. 抓拍链路（UDP 8889 → `/pic`）
+## 4. 抓拍链路（UDP 8889）—— 当前不可用
+
+> **当前状态：摄像头硬件故障，本条链路只到"接收并校验命令"为止。**
+> 命令会被正确解析并打印日志，但不会取图、不会闪灯、`/pic` 不可访问。
+> 更换摄像头模组或排线后，把 `CAMERA_BOOT_ENABLE` 改回 1 重新编译即可恢复。
 
 1. 基站判定跌倒后，向 `192.168.4.2:8889` 发送 **4 字节**命令 `55 AA 01 FF`。
 2. 穿戴端在 `loop()` 中调用 `checkCaptureCommand()` 轮询该端口，校验帧长与字节内容；
@@ -168,6 +173,7 @@ MPU 不要接 5V。本方案不使用 ESP32-CAM 的 microSD 卡槽，因为 `GPI
 
 ```text
 [BOOT] wearable_firmware: static IP + async capture
+[CAMERA] disabled: hardware unavailable (see README)
 抓拍任务已启动（异步执行）
 MPU WHO_AM_I = 0x74
 MPU启动成功
@@ -176,7 +182,8 @@ WiFi connected
 基站网关：192.168.4.1
 抓拍命令监听：UDP 8889
 UDP发送目标：192.168.4.1:8888
-Camera Ready! Use 'http://192.168.4.2' to connect
+[HTTP] not started: CAMERA_BOOT_ENABLE=0
+[CAPTURE] disabled: camera unavailable
 ```
 
 一直停在 `WiFi connecting` 通常需检查基站是否开机、热点参数是否一致。
@@ -223,7 +230,87 @@ Camera Ready! Use 'http://192.168.4.2' to connect
 
 ---
 
+---
+
 ## 10. 范围外
 
 - 算法对真实跌倒的准确性、长时间续航、穿戴可靠性，均不由接口联调自动证明。
 - 充电宝供电、线材固定、外壳佩戴、续航与长时间稳定性需单独实测。
+
+---
+
+## 11. 摄像头与抓拍链路
+
+### 抓拍流程
+
+基站判定跌倒后向穿戴端 `192.168.4.2:8889/UDP` 下发 4 字节命令 `55 AA 01 FF`。
+
+```text
+checkCaptureCommand()  校验命令，ok -> requestCapture()
+requestCapture()       点亮闪光灯，标记 150 ms 预热，置 captureBusy
+serviceCapture()       预热到点后交出信号量（主循环每轮推进）
+captureWorker()        取一帧 JPEG，复制到 PSRAM
+latest_photo_handler() /pic 返回该帧
+```
+
+抓拍在独立任务（core 0）里执行，主循环的 50 Hz 采样与 UDP 发送不受影响。
+
+### 抓拍命令端口
+
+命令端口用 `udp.begin(8889)` 绑定。绑定前必须先 `udp.stop()`：
+
+WiFi 尚未连上时 `begin()` 会失败，失败后 socket 可能留在半开状态，
+后续再次 `begin()` 仍会失败。若不清理状态，命令端口会永久失效，
+`checkCaptureCommand()` 因 `commandPortReady == false` 直接返回，
+表现为抓拍无响应、`/pic` 一直 `404`。
+
+### 自检点
+
+固件在三个位置各取一帧并打印结果，便于从串口直接判断摄像头状态：
+
+| 自检 | 位置 |
+|---|---|
+| `selftest` | `esp_camera_init()` 之后 |
+| `post-LED selftest` | `setupLedFlash()` 之后 |
+| `post-MPU selftest` | `setupMpu()` 之后 |
+
+正常输出示例：
+
+```text
+[CAMERA] esp_camera_init RETURN 0x0
+[CAMERA] selftest OK: 8518 bytes, 320x240, fmt=4
+[CAMERA] post-LED selftest OK: 8311 bytes
+[CAMERA] post-MPU selftest OK: 8779 bytes
+```
+
+### 抓拍链路诊断
+
+`/status` 在摄像头字段之后追加以下计数，不接串口也能定位卡在哪一步：
+
+| 字段 | 含义 |
+|---|---|
+| `camera_ready` | 摄像头是否初始化成功 |
+| `cmd_port_ready` | 8889 命令端口是否绑定成功 |
+| `capture_cmd_rx` | 收到并通过校验的抓拍命令数 |
+| `capture_reject` | 因未就绪或忙而被拒绝的次数 |
+| `capture_ok` | 成功存入 PSRAM 的照片数 |
+| `capture_fail` | 取帧或分配内存失败的次数 |
+
+判读：`cmd_port_ready=0` 为端口绑定问题；`cmd_rx>0` 而 `ok=0` 为取帧问题；
+`ok>0` 而 `/pic` 返回 `404` 为存储或路由问题。
+
+### 帧缓冲
+
+`fb_count` 决定连续出帧能力。`httpd_resp_send_chunk()` 是阻塞发送，
+WiFi 拥塞时一帧会占住缓冲不放；缓冲过少时驱动补不上新帧，
+`esp_camera_fb_get()` 返回 `NULL`。
+
+- `fb_count = 4`，`grab_mode = CAMERA_GRAB_LATEST`
+- 分辨率 `QVGA`（320x240），单帧约 8 KB，4 个缓冲在 PSRAM 中占用不到 64 KB
+- `stream_handler` 对取帧失败做 10 次重试（每次 50 ms），避免瞬时竞争导致断流
+
+### 排线接触
+
+`esp_camera_init()` 返回 `0x106`（`ESP_ERR_NOT_SUPPORTED`）表示 SCCB 读不到
+传感器型号，属于排线接触问题：断电后掀开排线座卡扣、拔出排线、重新插到底并
+锁上卡扣即可。固件本身不需要改动。

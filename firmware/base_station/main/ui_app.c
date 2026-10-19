@@ -248,7 +248,8 @@ static void render(ui_page_t page, const oled_status_t *snap)
         case PAGE_SYSTEM: oled_show_system(snap, k_ap_ssid, k_ap_channel); break;
         case PAGE_SET:    oled_show_settings(s_cursor); break;
         case PAGE_DEMO:   oled_show_demo(s_demo_scene, s_script_step,
-                                         (s_script_step >= 0)
+                                         ((s_script_step >= 0) &&
+                                          (s_script_step < (int)SCRIPT_N))
                                              ? k_script[s_script_step].name
                                              : NULL,
                                          s_demo_mute, s_demo);
