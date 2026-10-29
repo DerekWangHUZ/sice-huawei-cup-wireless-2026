@@ -257,7 +257,12 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   esp_err_t res = ESP_OK;
   size_t _jpg_buf_len = 0;
   uint8_t *_jpg_buf = NULL;
-  char *part_buf[128];
+  /*
+   * 上游 CameraWebServer 例程的原声明是 char *part_buf[128]（128 个指针，
+   * 512B 栈），实际只作 128 字节 scratch 用——改为本意的字符数组，
+   * 下方 (char *)part_buf 强转保持不变。
+   */
+  char part_buf[128];
 
   static int64_t last_frame = 0;
   if (!last_frame) {

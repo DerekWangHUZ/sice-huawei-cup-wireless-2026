@@ -5,6 +5,212 @@
 
 ---
 
+## [2026-10-26] 摄像头恢复启用 + 全套离线验证收尾 + 文档口径清理
+
+> 三件事：① 摄像头模组恢复可用，`CAMERA_BOOT_ENABLE` 默认翻回 1；
+> ② 上一条目遗留的全部离线验证在本机（D 盘仓库机器）补齐；
+> ③ 根 README 与 docs/（除本文件）按"当前事实"口径清理历史痕迹表述。
+
+### 一、摄像头恢复启用（联动固件 + 文档）
+
+- 摄像头模组恢复可用（用户确认），`wearable_firmware.ino` 的
+  `CAMERA_BOOT_ENABLE` 默认值 0 → **1**（全功能启动：摄像头三段自检 +
+  闪光灯 + 网页 + /pic）；宏注释改写为中性的编译期功能开关说明，
+  置 0 仍可用于隔离摄像头链路或最小化运行。
+- 双向编译验证（arduino-cli 1.5.2 / esp32 core 3.3.12 /
+  FQBN `esp32:esp32:esp32cam:PartitionScheme=huge_app,FlashMode=dio,FlashFreq=40`）：
+  默认(=1) 与临时置 0 均 **0 error / 8 warning**（全部为既有
+  volatile 计数器 `++` 的 `-Wvolatile` C++20 弃用告警）；
+  bin 体积 1,090,149 B（=1，34% of 3MB）/ 938,725 B（=0，29%）。
+- 2026-10-25 条目中"摄像头硬件故障停用"的前提自此作废。
+
+### 二、离线验证收尾（本机执行，全部通过）
+
+| 验证项 | 结果 |
+|---|---|
+| 穿戴端固件（两宏配置） | 0 error（见上） |
+| 离线自测 | `ALL 19` + `ALL 22 SCENARIOS PASSED`，总 PASS |
+| 基站 ESP-IDF v6.1 默认 stub | 0 error/0 warning，bin 947,744 B（分区余量 10%） |
+| 基站 `-DBS_CSI_IMPL=real` | 0 error/0 warning，bin 948,992 B（9%） |
+| 基站 `-DCSI_JUDGE_ENABLE=1` | 0 error/0 warning，bin 947,776 B（10%） |
+| FPGA 无头仿真（Vivado 2026.1） | `SIM RESULT: PASS`（86 项断言） |
+
+### 三、脚本与文档
+
+1. **`run_offline_tests.ps1` 补 lcc64 第二构建**：实测 lcc64 支持 `-D`，
+   posture-gate 构建不再对 lcc64 跳过；同时总结果增加 `$postureBuilt`
+   硬门禁（第二构建失败 = FAIL，不再可能静默弱化）。
+2. **文档口径清理**（根 README + docs/ 除本文件外全部）：删除日期标注、
+   修订叙事（"第 N 次上板实测修订/此前为误判/已实现/改回恢复"等），
+   统一为现在时态的中性事实陈述；摄像头能力恢复全功能表；顺带修正
+   过时数字（离线 17 场景 → 19+22；FPGA 仿真 60 断言 → 86）。
+   **firmware/ 内部文档（wearable README、tests README）按指示未动**，
+   其中摄像头停用期描述与现默认行为不符，待团队自行刷新。
+3. 本机构建注记：idf.py 须在 PowerShell 进程内 `Remove-Item Env:MSYSTEM`
+   后经 EIM profile 激活（`env -u`/置空均会被重注入）；仓库内
+   `firmware/base_station/build/` 为另一路径机器生成的失效缓存，已删除，
+   首次构建请用全新构建目录。
+
+### 四、实机冒烟测试（2026-10-26 当日，基站 + 穿戴端上电）
+
+- **基站（ESP32-S3，COM4/CH343）**：暂存版固件烧录成功（947,872B 校验一致）
+  并完整启动——SD 挂载记录 `DATA_115.CSV`、OLED 就绪、FPGA UART 就绪并
+  发送音频配置与心跳、`CSI stub active` 初始化日志正确、SoftAP/DHCP 池
+  （.2 保留）/UDP 8888 全部就绪，STATS 周期稳定无重启。未接穿戴端时
+  `packets=0 state=IDLE`，符合预期。FPGA 板未接入，上行链路未测。
+- **穿戴端（ESP32-CAM，COM9/CH340 TTL）**：板上固件实机通过 MPU 初始化
+  （WHO_AM_I=0x74）与摄像头自检（`[CAMERA] post-MPU selftest OK: 8601 bytes`）。
+  USB 供电不足导致 WiFi 启动阶段看门狗复位（一轮为 TG1WDT、一轮摄像头
+  init 返回 0x106 后 TG0WDT 快速复位循环）——同版固件在供电充足时摄像头
+  与 MPU 自检可过，属供电问题非固件缺陷；网络链路与抓拍全流程待稳定供电
+  （充电宝 5V）后回归。穿戴端烧录须经 MB 底板（自动下载），COM9 TTL 接法
+  仅可运行不可烧录。
+- **烧录口径修正**：穿戴端 README 移除"按住 IO0、短按 RST"的手动下载步骤
+  （本工程烧录由 MB 底板自动完成，与板上按键无关）；穿戴端 README 全文按
+  摄像头全功能现状同步改写（§0/§2/§4/§5/§6/§7/§8/§9）。
+- **50 Hz 数据链路实机打通**：穿戴端（MB 底板供电）与基站完成全链路——
+  基站 `packets=2812 frames_ok=2812 frames_bad=0 mag=0.98g`（静止重力值，
+  数值链路正确），穿戴端连续推流 `UDP #3492 fail=0`（新增发送失败计数
+  为 0，序号=成功发出帧数语义生效）；WiFi 断线自愈（基站复位后 2.4s 内
+  自动重连）实机验证通过。
+- **新增操作约束文档（wearable README §5.3）**：CAM 插 MB 底板（烧录姿态）
+  与接 MPU 排线（运行姿态）物理互斥——烧录姿态下 MPU 必然离线、不发帧，
+  "无数据"属预期；运行姿态下无法烧录，Upload 连不上先核对物理姿态；
+  姿态切换须重新上电（MPU 仅在 setup() 初始化）。此前"穿戴端无数据"
+  的现象即烧录姿态下的预期表现，非链路故障。
+
+### 未覆盖 / 已知事项（需上机）
+
+- 上机三件套不变：CSI（S3 AP 模式回调确认 → sigma_csi 三状态标定 →
+  翻转 `CSI_JUDGE_ENABLE=1` 回归）、姿态门佩戴标定四步、整机联调。
+- 穿戴端烧录配置口径：README §6 写 FlashFreq 40MHz，仓库中上一份实机
+  烧录构建（arduino 缓存）实际为板默认 80MHz；本次验证按 40MHz。
+  两者均可编译，上机时确认一次口径即可。
+- 穿戴端 README（firmware/ 内部）仍含摄像头停用期描述（§4/§7/§8），
+  与默认=1 的启动日志不同；不影响运行，团队可按需刷新。
+
+---
+
+## [2026-10-25] 离线代码质量加固 + CSI 数据通路落地 + 文档-代码对齐
+
+> 本次全部改动**纯离线验证**（无板）：基站经 ESP-IDF v6.1 完整编译 +
+> 离线自测双构建回归；穿戴端无编译环境，逐行人工核验（见"未覆盖"）。
+
+### 一、基站（可编译验证 + 离线回归）
+
+1. **离线自测恢复可移植**：`run_offline_tests.ps1` 编译器/Python 探测参数化
+   （gcc → MSVC vcvars → lcc64 后备），并新增**第二构建**
+   `test_harness_posture.exe`（`-DPOSTURE_CHECK_ENABLE=1`），两个二进制
+   都必须全绿才算 PASS。原脚本硬编码 MATLAB lcc64 路径，换机即失效。
+2. **姿态门离线场景组补全**（`POSTURE_CHECK_ENABLE` 的门逻辑 2026-10-18
+   已完整落地但从未被离线测试覆盖）：场景 18 校准后跌倒躺平→照常 CONFIRMED、
+   场景 19 校准后快速坐下→门拦截不报警（magnitude-only 判定的头号误报源）、
+   场景 20 未校准 fail-open 与门关闭行为逐位一致。`gen_frames.py` 新增
+   三个姿态场景合成帧（直立校准 2.1s / 躺平重力 +Y 夹角 ~82° / 坐姿 ~6°）。
+   `fall_core.h` 姿态门宏加 `#ifndef` 守卫并补**佩戴标定流程四步**注释；
+   默认值保持 0（待成员 B 上机标定后再翻转）。
+3. **代码级修复**：
+   - `fpga_link.c` 发送帧间隔保护由"持锁自旋烧 CPU"改为 `vTaskDelay(1)`
+     分片等待（帧间隔语义不变：互斥仍持有、间隔只会更长不会更短）；
+   - `settings.c` NVS 写入改**增量脏写**（影子副本 s_saved 对比，只写变更
+     key；旧实现每次调节写满 8 个 key，磨损放大 8 倍），同时修复 5 处
+     `snprintf(buf, n, 非字面格式串)` 的 format-security 隐患；
+   - `sd_log.c` 无卡探活加指数退避（前 3 次逐周期重试，之后 4/8/16 周期
+     封顶）：全量 `sd_log_init()`（SPI init+挂载）一次耗几十上百 ms，
+     无卡时逐周期重试会周期性阻塞 UI 任务；
+   - `fpga_uplink.c` UART 逐字节读改批量读（32B/次）；`s_last_ms`（int64，
+     32 位 Xtensa 上跨任务撕裂读）加 portMUX 短临界区；
+   - `oled_display.c` 删除内联 isqrt 拷贝，复用 `fall_core` 导出的
+     `fall_isqrt_u32`（同算法两份拷贝漂移风险）；遥测页 `row` 缓冲 24→32B
+     并对角速度显示加 999.9 物理限幅（否则触发
+     `-Werror=format-truncation`）；
+   - `base_station.c` DHCP 池 `htonl(0xC0A8040A)` 魔法数改 `IP4_ADDR` 宏。
+4. **评估后明确不改**（记录决策防后人重议）：任务看门狗订阅、SoftAP 初始化
+   失败向上传播——需上机观察，纯离线阶段不动运行时行为。
+
+### 二、CSI 数据通路（"通感"卖点落地到编译级）
+
+- **新增 `csi_stats.c/h`（纯 C99，进离线自测）**：子载波 IQ→幅度
+  （复用 `fall_isqrt_u32`）→单帧子载波间方差（一阶公式
+  `(N·Σx²-(Σx)²)/N²`，回调上下文只累加不做除法）→10 帧滑窗平均。
+  离线场景 21/22 锁死：方差精确值、ready 状态机、commit 节流（无新快照
+  不重复入窗）、滑窗环形覆盖、非法输入拒绝。
+- **新增 `csi_real.c`（编译期由 `main/CMakeLists.txt` 的 `BS_CSI_IMPL`
+  选择，默认 stub）**：`esp_wifi_set_csi_config`(LLTF only，关闭相邻子载波
+  滤波——滤波会抹平方差特征) + `set_csi_rx_cb` + `set_csi(true)`；
+  子载波数取 `csi_info->len/2`（不假设固定 64，S3 与 ESP32 classic 数量不同）。
+  采集源即穿戴端 STA 的 50Hz 上行包（ESP-CSI 只对本机收发的帧触发，
+  esp-csi#247），`csi_feed_packet()` 的调用点天然节流。
+- **`fall_core` CSI 辅助判据钩子（`CSI_JUDGE_ENABLE` 默认 0）**：
+  `fall_detector_set_csi()` 喂入窗口方差，确认门增加"方差 < sigma_csi"
+  分支；未就绪 fail-open（CSI 缺失绝不比纯 IMU 更保守漏报）。宏带
+  `#ifndef` 守卫，与姿态门同一开关模式。
+- **接口扩展**：`csi_stub.h` 新增 `csi_init()`（esp_wifi_start 后调用），
+  stub 为空操作；头注由"6 步 TODO"改写为"已实现/待上机"两栏。
+- **三种配置均编译验证通过**：默认 stub / `BS_CSI_IMPL=real` /
+  `CSI_JUDGE_ENABLE=1`（默认构建产物与历史行为逐字节同源）。
+
+### 三、穿戴端（无编译环境，人工核验）
+
+1. **实现 `CAMERA_BOOT_ENABLE`（修复"README 有、代码无"的缺口）**：
+   wearable README §4/§7 自 c5bd068 起描述该宏及其启动锚点，但对应代码
+   未提交。现补齐：默认 0（摄像头硬件故障期）跳过摄像头初始化/三段自检/
+   闪光灯/网页服务，打印 `[CAMERA] disabled` / `[HTTP] not started:
+   CAMERA_BOOT_ENABLE=0` / `[CAPTURE] disabled` 三锚点（与 README §7
+   逐条对齐）；MPU 50Hz 推流与 8889 命令接收（校验+日志）不受影响；
+   改回 1 即恢复全部功能。
+2. `app_httpd.cpp` 修复 vendored 遗留 bug：`char *part_buf[128]`（128 个
+   指针，本意 128 字节 scratch）→ `char part_buf[128]`。
+3. `sendImuPacket` 检查 `write/endPacket` 返回值：三步全成才递增
+   `packetSequence`（序号=成功发出的帧数），失败计入 `g_udpSendFail`
+   随 200ms 诊断行汇报（旧实现失败也递增序号，掩盖发送故障）。
+4. 8889 未知命令打印限流（每 5 秒最多一条，端口对全网开放时防刷屏）。
+5. 本地跌倒检测阈值与基站 `fall_core.h` 对齐（旧 2.2g/180dps/0.75~1.25g/
+   25dps/800ms/3000ms → 3.0g/—/0.65~1.35g/50dps/1500ms/4000ms），
+   消除"本地报跌倒、基站不报"的双阈值漂移；注释明确其为仅串口诊断，
+   不上报（18B 协议无本地判定字段）。
+6. **评估后保留** `wifi_keepalive` 内 `delay(20/50)`：仅发生在链路切换
+   时刻（此时数据流本已中断），而 socket 清理时序是上板验证过的修复
+   （c5bd068），无法编译+上板验证前不改动。
+
+### 四、文档对齐（代码为准）
+
+- 键映射修正：契约 §4.9 与说明书 §三 原文"上行键号 = 15 - pos（左上角
+  KEY15）"改为"= pos（扫描起点一角 KEY0，恒等映射）"——第四次上板反馈
+  （2026-10-19 同日修订第 1 条）已实测推翻 15-pos，但两份文档未同步，
+  排布图一并纠正。
+- 根 README：穿戴端能力表逐项标注停用/可用；目录树补 `CHANGELOG.md`、
+  `algorithm/`、`data/` 标注"预留待成员 C 交付"；CSI 表述由"预留接口"
+  更新为"数据通路已实现、默认未启用、判据待上机标定"。
+
+### 验证
+
+- 离线自测：默认构建 19 场景 + 姿态门构建 22 场景，全部 PASS
+  （MSVC cl 编译，脚本自动探测）。
+- 基站固件：ESP-IDF v6.1 + xtensa-esp-elf 15.2.0 完整编译三种配置
+  （stub/real/判据开启）全部通过，默认配置 bin 947KB，分区余量 10%。
+- CSI API 编译级验证以本机 `esp_wifi.h` 头文件实际签名为准
+  （`wifi_csi_config_t` 九字段、`wifi_csi_info_t.len`、`esp_wifi_set_csi_rx_cb`）。
+
+### 未覆盖 / 已知事项（需上机）
+
+- **穿戴端全部改动未经编译验证**（本机无 arduino-cli，沿仓库既有惯例）：
+  烧录前建议先 Arduino IDE 编译一次确认零错误，重点看 `CAMERA_BOOT_ENABLE`
+  两分支与 `checkFall` 改动。
+- CSI 三件上机事项（详见 `csi_stub.h` 头注）：① S3 AP 模式回调确触发
+  （`csi_ready()` 变 true）；② 标定 sigma_csi（静止/活动/躺平三状态采集
+  CSI_Variance 序列取分界，填 `CSI_FALL_VAR_MAX`）；③ 翻转
+  `CSI_JUDGE_ENABLE=1` 并回归全部场景。
+- 姿态门待成员 B 确定佩戴方案后按 `fall_core.h` 标定流程四步执行，
+  再翻转默认值。
+- 本机构建注记：xtensa-gcc 15.2 全并行编译 `esp_lcd_panel_rgb.c` 会触发
+  编译器内部错误（ira pass 段错误，间歇性），`-j2` 稳定；另 idf.py 拒绝
+  MSYSTEM 环境（Git Bash 会向原生子进程重注入），须在 cmd 内
+  `set MSYSTEM=` 后驱动 cmake+ninja——本机入口 `build_bs.cmd`（不入库，
+  已加入 .gitignore）。
+
+---
+
 ## [2026-10-19] 穿戴端联调收尾：抓拍命令端口、帧缓冲与流稳定性
 
 ### 现象与定位

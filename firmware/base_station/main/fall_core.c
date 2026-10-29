@@ -157,8 +157,10 @@ uint32_t fall_gyro_magnitude2(const int16_t gyro[3])
 }
 
 /* 逐位整数开方（标准"移位-比较"算法），纯整数、无分支依赖浮点。
- * 用于把 LSB² 的平方模长还原成 LSB 幅值。 */
-static uint32_t isqrt_u32(uint32_t v)
+ * 用于把 LSB² 的平方模长还原成 LSB 幅值。
+ * 导出供其他模块复用（oled_display 的角速度合成显示用同一实现，
+ * 避免同一算法两份拷贝各自漂移）。 */
+uint32_t fall_isqrt_u32(uint32_t v)
 {
     uint32_t r = 0;
     uint32_t bit = (uint32_t)1 << 30;   /* 最大偶数次幂 <= 2^32-1 */
@@ -183,7 +185,7 @@ uint16_t fall_acc_mag_centi_g(const int16_t acc[3])
     /* mag_lsb = |a| 的 LSB 幅值；1g = ACC_LSB_PER_G(2048) LSB
      * 0.01g 单位 = |a|/2048*100 = |a|*100/2048
      * mag_lsb 最大 ~56755（3 轴各 32768），*100 = 5.68e6，uint32 安全。 */
-    uint32_t mag_lsb = isqrt_u32(fall_acc_magnitude2(acc));
+    uint32_t mag_lsb = fall_isqrt_u32(fall_acc_magnitude2(acc));
     uint32_t centi   = (mag_lsb * 100u) / 2048u;
 
     if (centi > 9999u) {
@@ -217,11 +219,30 @@ void fall_detector_init(fall_detector_t *d)
 #if POSTURE_CHECK_ENABLE
     d->have_ref        = false;
 #endif
+#if CSI_JUDGE_ENABLE
+    d->csi_var         = 0;
+    d->csi_valid       = false;
+#endif
 }
 
 bool fall_detector_alarm_active(const fall_detector_t *d)
 {
     return (d->state == FALL_STATE_CONFIRMED);
+}
+
+void fall_detector_set_csi(fall_detector_t *d, uint32_t variance, bool ready)
+{
+#if CSI_JUDGE_ENABLE
+    if (d == NULL) {
+        return;
+    }
+    d->csi_var   = variance;
+    d->csi_valid = ready;
+#else
+    (void)d;
+    (void)variance;
+    (void)ready;
+#endif
 }
 
 bool fall_detector_force_clear(fall_detector_t *d)
@@ -287,6 +308,28 @@ static bool posture_allows_confirm(const fall_detector_t *d, const int16_t acc[3
 {
     (void)d;
     (void)acc;
+    return true;
+}
+#endif
+
+#if CSI_JUDGE_ENABLE
+/*
+ * CSI 门：确认跌倒前要求"环境扰动已消失"（默认关闭，见 fall_core.h）。
+ * 判据：最近窗口平均方差 < CSI_FALL_VAR_MAX（sigma_csi）。
+ * CSI 数据未就绪 -> 放行（fail-open），行为与门关闭一致——
+ * CSI 是辅助判据，缺失时绝不能比"只有 IMU"时更保守而漏报。
+ */
+static bool csi_allows_confirm(const fall_detector_t *d)
+{
+    if (!d->csi_valid) {
+        return true;
+    }
+    return d->csi_var < CSI_FALL_VAR_MAX;
+}
+#else
+static bool csi_allows_confirm(const fall_detector_t *d)
+{
+    (void)d;
     return true;
 }
 #endif
@@ -402,13 +445,15 @@ fall_state_t fall_detector_feed(fall_detector_t *d,
                 d->calm_start_ms = now_ms;
             }
             if ((now_ms - d->calm_start_ms >= STILL_WINDOW_MS) &&
-                posture_allows_confirm(d, acc)) {
-                /* 持续静止满窗口 -> 确认跌倒 */
+                posture_allows_confirm(d, acc) &&
+                csi_allows_confirm(d)) {
+                /* 持续静止满窗口 + 姿态门/CSI 门放行 -> 确认跌倒 */
                 d->state           = FALL_STATE_CONFIRMED;
                 d->confirm_time_ms = now_ms;
                 d->calm_start_ms   = 0;
             } else if (pending_expired) {
-                /* 仍静止但判据未满足（如姿态门拒绝）-> 到上限按非跌倒处理 */
+                /* 仍静止但判据未满足（如姿态门/CSI 门拒绝）-> 到上限
+                   按非跌倒处理 */
                 d->state           = FALL_STATE_IDLE;
                 d->motion_start_ms = 0;
                 d->calm_start_ms   = now_ms;

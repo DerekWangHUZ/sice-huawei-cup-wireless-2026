@@ -1,8 +1,13 @@
 /*
- * csi_stub.c -- CSI 占位实现
+ * csi_stub.c -- CSI 占位实现（默认构建，行为与历史版本一致）
  *
- * 详见 csi_stub.h 的接入点说明。本期不实现任何真实 CSI 逻辑：
- *   - csi_feed_packet()   空操作
+ * 真实实现已就绪：csi_real.c（WiFi CSI 回调 -> csi_stats 方差统计）。
+ * 两者实现同一份 csi_stub.h 接口，由 main/CMakeLists.txt 的
+ * BS_CSI_IMPL 在编译期选择（默认 stub；上机联调后可切 real）。
+ *
+ * 占位行为：
+ *   - csi_init()          空操作（返回 ESP_OK）
+ *   - csi_feed_packet()   仅计数（日志可验证调用链接通）
  *   - csi_get_variance()  返回常数 0
  *   - csi_ready()         恒 false
  *
@@ -12,24 +17,37 @@
 
 #include "csi_stub.h"
 
+#include "esp_err.h"
+#include "esp_log.h"
+
+static const char *TAG = "CSI";
+
 /* 占位统计计数器：保留字段以便真实实现直接替换，
    同时让日志能显示"已调用次数"，便于验证调用链确实接通。 */
 static uint32_t s_packet_count = 0;
 
+esp_err_t csi_init(void)
+{
+    /* 占位：不注册任何 WiFi CSI 回调。真实实现见 csi_real.c。 */
+    ESP_LOGI(TAG, "CSI stub active (BS_CSI_IMPL=stub, variance stays 0)");
+    return ESP_OK;
+}
+
 void csi_feed_packet(void)
 {
     s_packet_count++;
-    /* TODO(真实 CSI)：在此读取 Wi-Fi CSI 回调累积的统计量 */
+    /* 每 5000 包打一条计数日志：验证调用链在跑（真实实现在 csi_real.c） */
+    if (s_packet_count % 5000u == 0u) {
+        ESP_LOGD(TAG, "stub fed %u packets", (unsigned)s_packet_count);
+    }
 }
 
 uint32_t csi_get_variance(void)
 {
-    /* TODO(真实 CSI)：返回 64 子载波幅度方差 */
     return 0u;
 }
 
 bool csi_ready(void)
 {
-    /* TODO(真实 CSI)：回调注册成功且已收到数据后返回 true */
     return false;
 }

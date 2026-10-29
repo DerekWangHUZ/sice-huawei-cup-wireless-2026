@@ -11,7 +11,7 @@
 | ESP32-S3（基站） | `firmware/base_station` | SoftAP（CSI_FALL_AP/信道6）+ UDP 8888 收包 + 18B 帧解析 + 跌倒判定状态机 + UART 双向链路（下行控制帧 / 上行 UI 帧）+ OLED 五页面 UI + 键盘导航 + 可视化设置（NVS）+ 演示剧本 + microSD CSV 记录 + 抓拍指令 | ✅ 完成 |
 | Artix-7（协处理器） | `firmware/coprocessor` | UART 收发 + 帧解码（滑动重同步）+ 4×4 键盘扫描与拨码消抖 + 上行快照/键事件 + 6 位数码管词形显示 + 蜂鸣器运行期可调音/静音 + 12 颗 LED 动效与链路灯 + 显示仲裁 + 上电自检 + 可固化到板载配置 Flash | ✅ 完成 |
 
-**验证方式**：FPGA 无头仿真 `SIM RESULT: PASS`（60 项断言）；Vivado 综合/实现/比特流 `BITSTREAM_OK`、`All user specified timing constraints are met`；S3 `idf.py build` 0 error / 0 warning；离线自测 17 场景全过。
+**验证方式**：FPGA 无头仿真 `SIM RESULT: PASS`（86 项断言）；Vivado 综合/实现/比特流 `BITSTREAM_OK`、`All user specified timing constraints are met`；S3 `idf.py build` 0 error / 0 warning（stub / real / CSI 判据开启三种配置）；离线自测双构建 19+22 场景全过。
 
 ---
 
@@ -48,7 +48,7 @@
 | 模块 | 文件 | 职责 |
 |---|---|---|
 | 姿态帧解析 + 跌倒判定 | `main/fall_core.c/.h` | 纯 C99 核心，阈值集中在头文件顶部；含人工解除接口 |
-| CSI 占位 | `main/csi_stub.c/.h` | 接口已留好，`csi_ready()` 恒 false |
+| CSI 采集与统计 | `main/csi_stats.c/.h` + `csi_stub.c`/`csi_real.c` | 纯 C99 子载波幅度方差滑窗统计（进离线自测）；采集实现由 `BS_CSI_IMPL` 编译期二选一（默认 stub，`csi_ready()` 恒 false） |
 | FPGA 下行链路 | `main/fpga_link.c/.h` | UART1 双向（TX GPIO17 / RX GPIO18），下行命令 + `0x03` 音频配置 + 发送互斥 |
 | FPGA 上行接收 | `main/fpga_uplink.c/.h` | UART1 RX 读取 + 快照/键事件投递 + 链路心跳存活 |
 | 上行帧解析 | `main/ui_proto.c/.h` | 纯 C99，与 `rtl/cmd_decoder.v` 逐字段对应，离线自测覆盖 |
@@ -91,11 +91,11 @@ RTL/约束放在 `rtl/`、`constrs/`，不放 Vivado 生成的 `coprocessor.srcs
   而非"坏了"），详见 [FPGA实验板资料参考.md](FPGA实验板资料参考.md) §3。
 - **人机输入**：4×4 矩阵键盘（行扫描 + 列上拉 + 20ms 消抖）与拨码 SW1/SW2，
   键位与开关功能表见契约 §4.9 与 [开关按键使用说明书.md](开关按键使用说明书.md)。
-- **FPGA 复位**：`rst_n`(T9) 须开内部上拉（`PULLUP true`），已在 `pins.xdc` 落实。
+- **FPGA 复位**：`rst_n`(T9) 须开内部上拉（`PULLUP true`），`pins.xdc` 中已配置。
 - **上电启动**：该板需上电后按一次 CONFIG 按钮才会从 Flash 启动，详见
   [FPGA实验板资料参考.md](FPGA实验板资料参考.md) §9b。
 - 数码管按 6 位实现（位选 `an[0..5]`）；段码极性/位选极性做成模块参数
-  （`seg_display.v` 的 `SEG_INVERT`/`AN_ACTIVE_LOW`），上板不符改参数即可。
+  （`seg_display.v` 的 `SEG_INVERT`/`AN_ACTIVE_LOW`），可按板型调整。
 - 板间协议（下行 + 上行）权威定义见 [团队协作规范与接口契约.md](团队协作规范与接口契约.md) §四。
 - **上机操作文档按仓库规范不入库**（烧录/接线/连热点/发假包/每步现象/排障），
   由开发者自行保管，仓库内不引用。
@@ -104,5 +104,8 @@ RTL/约束放在 `rtl/`、`constrs/`，不放 Vivado 生成的 `coprocessor.srcs
 
 ## 六、范围外事项
 
-- 真实 CSI 提取（需穿戴端在场，`csi_stub` 占位留接口；CSV 的 `CSI_Variance` 列恒 0）
+- 真实 CSI 的**上机联调与 sigma_csi 标定**（采集与统计通路及判据钩子就绪：
+  `csi_stats.c` 离线单测覆盖，`csi_real.c` 经 `BS_CSI_IMPL=real` 构建验证，
+  默认构建为 stub、CSV 的 `CSI_Variance` 列为 0；
+  上机三步事项见 `csi_stub.h` 头注）
 - SD 运行中热插拔的完整重挂载（六脚模块无卡检测脚，靠扇区探活发现拔卡）

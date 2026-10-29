@@ -4,8 +4,9 @@
 > 固件入口：`main/wearable_firmware/wearable_firmware.ino`
 
 本工程是跌倒检测系统的穿戴标签端：以 50 Hz 向固定基站推送 18 字节原始 IMU 帧，
-摄像头当前**不可用**（硬件故障，详见第 11 节），网页视频与 `/pic` 抓拍均已停用；
-本工程实际运行的能力是 **50 Hz 姿态推流** 与 **UDP 8889 抓拍命令接收（仅记录）**。
+并通过 UDP 8889 接收基站抓拍命令，取图存 PSRAM 供 `/pic` 页面查看；
+摄像头相关功能由编译期宏 `CAMERA_BOOT_ENABLE` 控制（默认 1 全功能，
+置 0 时仅保留推流与命令接收，见第 4/11 节）。
 
 ---
 
@@ -53,8 +54,8 @@ Arduino 要求主 `.ino` 与所在文件夹同名，因此正式入口为
 | 子网掩码 | `255.255.255.0` |
 | 上行姿态数据 | 穿戴端 → `192.168.4.1:8888/UDP` |
 | 抓拍命令监听 | 穿戴端 ← `192.168.4.2:8889/UDP` |
-| 摄像头主页 | 不可用（摄像头故障） |
-| 最近抓拍照片 | 不可用（摄像头故障） |
+| 摄像头主页 | `http://192.168.4.2/` |
+| 最近抓拍照片 | `http://192.168.4.2/pic` |
 
 穿戴端以**静态地址**接入：`setup()` 中依次执行 `WiFi.mode(WIFI_STA)` →
 `WiFi.config(192.168.4.2, 192.168.4.1, 255.255.255.0)` → `WiFi.begin()`，
@@ -92,11 +93,11 @@ python tools/udp_receiver.py
 
 ---
 
-## 4. 抓拍链路（UDP 8889）—— 当前不可用
+## 4. 抓拍链路（UDP 8889）
 
-> **当前状态：摄像头硬件故障，本条链路只到"接收并校验命令"为止。**
-> 命令会被正确解析并打印日志，但不会取图、不会闪灯、`/pic` 不可访问。
-> 更换摄像头模组或排线后，把 `CAMERA_BOOT_ENABLE` 改回 1 重新编译即可恢复。
+> 摄像头相关功能（取图/闪灯/网页/`/pic`）由编译期宏 `CAMERA_BOOT_ENABLE`
+> 控制，默认 1 全功能；置 0 时命令仍会被解析并打印日志，但不取图、不闪灯、
+> `/pic` 不可访问。
 
 1. 基站判定跌倒后，向 `192.168.4.2:8889` 发送 **4 字节**命令 `55 AA 01 FF`。
 2. 穿戴端在 `loop()` 中调用 `checkCaptureCommand()` 轮询该端口，校验帧长与字节内容；
@@ -118,7 +119,7 @@ python tools/udp_receiver.py
 
 ### 5.1 MPU 与 ESP32-CAM
 
-| MPU 引脚 | ESP32-CAM 引脚 | 当前线色 |
+| MPU 引脚 | ESP32-CAM 引脚 | 线色 |
 |---|---|---|
 | `VCC` | `3V3` | 白 |
 | `GND` | 普通 `GND` | 黑 |
@@ -127,9 +128,9 @@ python tools/udp_receiver.py
 
 MPU 不要接 5V。本方案不使用 ESP32-CAM 的 microSD 卡槽，因为 `GPIO14/15` 已用于 MPU。
 
-### 5.2 ESP32-CAM-MB 与 ESP32-CAM（脱离插座调试时）
+### 5.2 ESP32-CAM-MB 底板与 ESP32-CAM
 
-| MB 连接 | ESP32-CAM 引脚 | 当前线色 |
+| MB 连接 | ESP32-CAM 引脚 | 线色 |
 |---|---|---|
 | 供电 | `5V` | 灰 |
 | 地 | 普通 `GND` | 黑 |
@@ -137,11 +138,26 @@ MPU 不要接 5V。本方案不使用 ESP32-CAM 的 microSD 卡槽，因为 `GPI
 
 注意：板上标为 `GND/R` 的引脚带复位功能，不作为普通地线使用。
 
+### 5.3 两种姿态互斥（操作前必读）
+
+**ESP32-CAM 插入 MB 底板（烧录姿态）与连接 MPU 排线（运行姿态）互斥**，
+同一时刻只能处于其一，由此有三条操作纪律：
+
+1. **烧录姿态下 MPU 必然离线**：启动日志出现"MPU 没有连接"属预期，
+   固件按设计不发姿态帧（OLED/基站均显示无数据）。不要在烧录姿态下
+   排查 MPU，也不要把"无数据"当成链路故障。
+2. **运行姿态下无法烧录**：CAM 不在 MB 底板上时，Upload 必然
+   `Failed to connect`——遇到时先核对 CAM 是否在 MB 底板上，不要在其他
+   接法下反复重试烧录。
+3. **姿态切换需重新上电**：MPU 只在上电时的 `setup()` 里初始化，
+   接好 MPU 后重新上电才生效；烧录完成后把 CAM 装回运行姿态再上电，
+   不要在烧录姿态下直接做运行测试（推流/入网/抓拍等）。
+
 ---
 
 ## 6. 开发环境与烧录
 
-- Arduino IDE：已在 `2.3.10` 验证。
+- Arduino IDE：`2.3.10`。
 - 开发板：`AI Thinker ESP32-CAM`。
 - 串口监视器：`115200 baud`。
 - 正式固件直接读写 MPU 寄存器，不依赖 Adafruit MPU6050 库。
@@ -150,7 +166,7 @@ MPU 不要接 5V。本方案不使用 ESP32-CAM 的 microSD 卡槽，因为 `GPI
 | 设置 | 值 |
 |---|---|
 | Board | AI Thinker ESP32-CAM |
-| Port | 当前真实出现的 COM 口 |
+| Port | 设备实际出现的 COM 口 |
 | Upload Speed | 115200 |
 | Flash Mode | DIO |
 | Flash Frequency | 40MHz |
@@ -159,9 +175,9 @@ MPU 不要接 5V。本方案不使用 ESP32-CAM 的 microSD 卡槽，因为 `GPI
 
 烧录流程：
 
-1. 关闭其他串口监视器，拔 USB，按已验证方向把板子插回 USB 底板。
+1. 关闭其他串口监视器，拔 USB，把 ESP32-CAM 插到 MB 底板上。
 2. 用能识别 COM 口的 USB 数据线连接电脑。
-3. 点 Upload；若需手动下载，按住 IO0、短按并松开 RST，保持 IO0 直到开始 Writing 再松开。
+3. 点 Upload；下载由底板自动完成，无需任何按键操作。
 4. 等写入校验成功、无 `Failed uploading`。
 5. 烧录完成后断开电脑 USB，再用充电宝 5V 供电运行；**不要同时用电脑 USB 和外接 5V 并联供电**。
 
@@ -173,21 +189,24 @@ MPU 不要接 5V。本方案不使用 ESP32-CAM 的 microSD 卡槽，因为 `GPI
 
 ```text
 [BOOT] wearable_firmware: static IP + async capture
-[CAMERA] disabled: hardware unavailable (see README)
+[CAMERA] esp_camera_init RETURN 0x0
+[CAMERA] selftest OK: 8518 bytes, 320x240, fmt=4
+[CAMERA] post-LED selftest OK: 8311 bytes
 抓拍任务已启动（异步执行）
 MPU WHO_AM_I = 0x74
 MPU启动成功
+[CAMERA] post-MPU selftest OK: 8779 bytes
 WiFi connected
 穿戴端静态地址：192.168.4.2
 基站网关：192.168.4.1
 抓拍命令监听：UDP 8889
 UDP发送目标：192.168.4.1:8888
-[HTTP] not started: CAMERA_BOOT_ENABLE=0
-[CAPTURE] disabled: camera unavailable
+Camera Ready! Use 'http://192.168.4.2' to connect
 ```
 
+自检字节数随画面内容变化，三条 `[CAMERA] ... OK` 齐全即摄像头链路健康。
 一直停在 `WiFi connecting` 通常需检查基站是否开机、热点参数是否一致。
-`Brownout` 或重复启动日志属于供电不足，先解决供电再看其余。
+`Brownout`、看门狗复位或重复启动日志属于供电不足，先解决供电再看其余。
 
 ---
 
@@ -201,7 +220,7 @@ UDP发送目标：192.168.4.1:8888
    串口打出 `Camera Ready` 本身不证明 HTTP 实际可访问。
 4. 基站连续观察 30 秒的 `STATS packets=... frames_ok=... frames_bad=...`：
    计数应增长，坏帧不持续增加。相邻有效帧增量除以实际时间间隔应接近 50 包/秒。
-5. 基站按其已验证动作方案判定（模块固定在绝缘支撑上受控操作，不让真人跌倒、不扔板撞地），
+5. 基站按其判定规则给出动作（模块固定在绝缘支撑上受控操作，不让真人跌倒、不扔板撞地），
    应经历 `PENDING -> CONFIRMED` 并打印 `snap cmd sent to 192.168.4.2:8889`。
    未达到 CONFIRMED 不等于抓拍接口失效。
 6. 确认穿戴端闪灯约 1 秒，打开 `http://192.168.4.2/pic` 查看照片；
@@ -213,22 +232,20 @@ UDP发送目标：192.168.4.1:8888
 9. 如已连接 FPGA，实际核对声光报警及解除；未接则记录为“穿戴端—基站接口联调”，
    不宣称整机报警已通过。
 
-> 第一次还未抓拍时 `/pic` 返回 404 属正常。基站日志“已发送”只代表发送调用完成，
+> 尚未抓拍时 `/pic` 返回 404 属正常。基站日志"已发送"只代表发送调用完成，
 > 不能代替穿戴端收到命令、闪灯与照片实际更新的证据。
 
 ---
 
 ## 9. 重要兼容性说明
 
-1. 当前 MPU 模块在 I2C 地址 `0x68` 可正常读取，但返回 `WHO_AM_I = 0x74`。
-   Adafruit MPU6050 库会因型号识别不匹配而报告“没有找到 MPU6050”，
-   所以正式固件采用寄存器直读方式。
-2. 摄像头与 MPU 同时运行时，MPU 使用 `TwoWire(0)`。
-   改用 `TwoWire(1)` 会出现 `I2C bus id(1) has already been acquired`。
-3. 摄像头默认切到 QVGA，以降低延迟和内存压力；网页中继续调高分辨率可能明显卡顿。
-4. `mpu6050_test` 仅保留失败排查过程，不是正式入口。
-
----
+1. MPU 模块在 I2C 地址 `0x68` 应答，`WHO_AM_I` 返回 `0x74`（兼容型号）。
+   Adafruit MPU6050 库按期望型号校验会报告"没有找到 MPU6050"，
+   因此正式固件采用寄存器直读方式。
+2. 摄像头与 MPU 同时运行时，MPU 使用 `TwoWire(0)`；
+   `TwoWire(1)` 会报 `I2C bus id(1) has already been acquired`（控制器被摄像头占用）。
+3. 摄像头默认 QVGA，以降低延迟和内存压力；网页中继续调高分辨率可能明显卡顿。
+4. `mpu6050_test` 不是正式入口，仅作库兼容性参考。
 
 ---
 

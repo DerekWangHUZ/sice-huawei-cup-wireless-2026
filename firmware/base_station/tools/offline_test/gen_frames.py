@@ -239,6 +239,63 @@ def scene_bump_walk_sit():
     return out
 
 
+def scene_posture_fall_lying(n=231):
+    """
+    姿态门场景 18：直立校准后跌倒躺平（2026-10-25 新增，姿态门构建专用）：
+      前 105 帧   直立静止 2.1s（> POSTURE_CALIB_STILL_MS 2s，竖直参考在此校准）
+      25 帧       走动（> MOTION_HOLD_MS，进入 WALK）
+      第 130 帧   冲击（> 3g）-> PENDING
+      之后 100 帧 躺平静止：重力向量与竖直参考夹角 ~85° > 60°，
+                  门放行 -> 静止满 1.5s 确认
+    期望：IDLE -> WALK -> PENDING -> CONFIRMED（门放行路径）
+    """
+    out = []
+    for i in range(105):                           # 直立校准 2.1s
+        out.append((i * 20, (0.02, 0.03, 1.00), (0.5, -0.4, 0.3)))
+    for i in range(105, 130):                      # 走动 25 帧
+        out.append((i * 20, (0.15, 1.10, 0.75), (60.0, 25.0, -18.0)))
+    out.append((130 * 20, (3.4, -1.8, 2.6), (420.0, -260.0, 130.0)))   # 冲击
+    for i in range(131, n):                        # 躺平（+Y 重力，夹角 ~85°）
+        out.append((i * 20, (0.10, 0.98, 0.05), (1.5, -1.0, 0.8)))
+    return out
+
+
+def scene_posture_fast_sit(n=311):
+    """
+    姿态门场景 19：直立校准后快速坐下（2026-10-25 新增，头号误报回归）：
+      前 105 帧   直立静止 2.1s（完成校准）
+      第 105 帧   坐下冲击（> 3g，IDLE 直接管 PENDING）
+      之后        坐姿静止：与竖直参考夹角 ~6° < 60°，
+                  门拦截 -> PENDING_MAX(4s) 到期按非跌倒退出
+    期望：IDLE -> PENDING -> IDLE（全程不 CONFIRMED）
+    """
+    out = []
+    for i in range(105):                           # 直立校准 2.1s
+        out.append((i * 20, (0.02, 0.03, 1.00), (0.5, -0.4, 0.3)))
+    out.append((105 * 20, (3.4, -1.8, 2.6), (420.0, -260.0, 130.0)))   # 坐下冲击
+    for i in range(106, n):                        # 坐姿（近直立，夹角 ~6°）
+        out.append((i * 20, (0.08, 0.10, 0.99), (1.2, -0.9, 0.7)))
+    return out
+
+
+def scene_posture_uncalib_fall(n=126):
+    """
+    姿态门场景 20：未校准 fail-open 对等（2026-10-25 新增）：
+      无校准期（第 1 帧即走动），姿态门在未校准时必须逐位等价于门关闭：
+      前 25 帧    走动
+      第 25 帧    冲击
+      之后 100 帧 躺平静止（与竖直夹角 ~85°，但参考未建立 -> 门放行）
+    期望：IDLE -> WALK -> PENDING -> CONFIRMED（与门关闭行为一致）
+    """
+    out = []
+    for i in range(25):
+        out.append((i * 20, (0.15, 1.10, 0.75), (60.0, 25.0, -18.0)))
+    out.append((25 * 20, (3.4, -1.8, 2.6), (420.0, -260.0, 130.0)))
+    for i in range(26, n):
+        out.append((i * 20, (0.10, 0.98, 0.05), (1.5, -1.0, 0.8)))
+    return out
+
+
 SCENES = {
     'idle':                 scene_idle(),
     'walk':                 scene_walk(),
@@ -248,6 +305,9 @@ SCENES = {
     'fall_late_still':      scene_fall_late_still(),
     'fall_boundary_twitch': scene_fall_boundary_twitch(),
     'bump_walk_sit':        scene_bump_walk_sit(),
+    'posture_fall_lying':   scene_posture_fall_lying(),
+    'posture_fast_sit':     scene_posture_fast_sit(),
+    'posture_uncalib_fall': scene_posture_uncalib_fall(),
 }
 
 

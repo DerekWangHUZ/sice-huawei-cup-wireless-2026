@@ -144,8 +144,26 @@ void posture_parser_reset(void);
  *   行为与门关闭完全一致。
  *   ⚠️ 前提：佩戴位置/朝向相对固定（胸口/腰部）。手臂佩戴朝向不可靠。
  *   待成员 B 确定佩戴方案后再置 1。
+ *
+ * 佩戴方案标定流程（上机时执行，步骤缺一不可）：
+ *   1) 按最终方案佩戴（胸口或腰部，朝向固定），上电后保持直立/坐直
+ *      静止 ≥ POSTURE_CALIB_STILL_MS(2s)，竖直参考自动完成校准
+ *      （串口无打印，验证方法：触发一次跌倒应仍能 CONFIRMED）；
+ *   2) 依次采集"直立静止 30s / 躺平(仰/侧/俯) 30s / 快速坐下 10 次"
+ *      的 SD 卡 CSV，核对躺平帧与直立帧的合向量夹角确实 > 60°、
+ *      坐姿帧 < 60°（用 algorithm/ 侧脚本或人工抽点）；
+ *   3) 若某佩戴朝向下躺平/坐姿夹角区分度不足（接近 60°），同步调整
+ *      POSTURE_LYING_ANGLE_DEG 与 POSTURE_LYING_COS2_Q4（联动）；
+ *   4) 离线回归两套测试（默认 + 姿态门开启构建）全绿后，方可把
+ *      默认值翻转为 1。
+ *
+ * 宏带 #ifndef 守卫：编译命令加 -DPOSTURE_CHECK_ENABLE=1 可在不改
+ * 源码的情况下构建"姿态门开启"的固件/离线测试（test_harness 的
+ * 姿态门场景组即用此方式编译，见 run_offline_tests.ps1 第二个构建）。
  */
+#ifndef POSTURE_CHECK_ENABLE
 #define POSTURE_CHECK_ENABLE      0
+#endif
 #define POSTURE_CALIB_STILL_MS    2000u
 
 /* 躺平判据：与竖直参考夹角超过此角度视为躺平。60°。
@@ -158,6 +176,26 @@ void posture_parser_reset(void);
 /* 帧超时：超过此时间没收到新帧则回到 IDLE（穿戴端掉线保护；
  * 仅对非告警态生效，CONFIRMED 告警锁存不受掉线影响） */
 #define DATA_TIMEOUT_MS        3000u
+
+/*
+ * CSI 辅助判据（契约 §2.2 第三段，默认关闭）：
+ *   开启后，CONFIRMED 判定额外要求"跌倒后环境扰动消失"——
+ *   最近 CSI 方差 < CSI_FALL_VAR_MAX（sigma_csi）。
+ *   CSI 数据未就绪（csi_ready()=false）时 fail-open 放行，
+ *   行为与关闭完全一致。
+ *   ⚠️ CSI_FALL_VAR_MAX 是【待上机标定的占位值】：需先启用
+ *   BS_CSI_IMPL=real 采集"静止/活动/跌倒躺平"三种状态的
+ *   CSI_Variance 序列（SD 卡 CSV），取静止/活动分布分界后再定，
+ *   见 csi_stub.h 头注与 CHANGELOG 2026-10-25。
+ * 宏带 #ifndef 守卫：编译命令 -DCSI_JUDGE_ENABLE=1 可不改源码构建
+ * "判据开启"版本（与 POSTURE_CHECK_ENABLE 同一模式）。
+ */
+#ifndef CSI_JUDGE_ENABLE
+#define CSI_JUDGE_ENABLE       0
+#endif
+#if CSI_JUDGE_ENABLE
+#define CSI_FALL_VAR_MAX       50u    /* sigma_csi 占位值，待上机标定 */
+#endif
 
 /* --- 传感器换算常量 --- */
 #define ACC_LSB_PER_G          2048.0f    /* 1g 对应的 ADC 计数 */
@@ -189,6 +227,11 @@ typedef struct {
     uint32_t ref_acc2;          /* 参考向量平方模长（LSB²） */
     bool     have_ref;          /* 是否已完成竖直参考校准 */
 #endif
+#if CSI_JUDGE_ENABLE
+    /* CSI 辅助判据状态（CSI_JUDGE_ENABLE=1 时使用，默认关闭不占内存） */
+    uint32_t csi_var;           /* 最近喂入的窗口平均方差 */
+    bool     csi_valid;         /* CSI 数据是否就绪（false -> 判据 fail-open） */
+#endif
 } fall_detector_t;
 
 /* 初始化状态机（上电调用一次） */
@@ -215,6 +258,14 @@ fall_state_t fall_detector_tick(fall_detector_t *d, uint32_t now_ms);
 
 /* 是否处于告警态（state == CONFIRMED） */
 bool fall_detector_alarm_active(const fall_detector_t *d);
+
+/*
+ * 喂入最新 CSI 方差（每个姿态帧调用一次；由 base_station.c 从
+ * csi_get_variance()/csi_ready() 取值后传入）。
+ *   ready=false 表示 CSI 未就绪 -> 判据 fail-open（等同关闭）。
+ *   CSI_JUDGE_ENABLE=0 时为空操作（保持纯 C99 无平台依赖）。
+ */
+void fall_detector_set_csi(fall_detector_t *d, uint32_t variance, bool ready);
 
 /*
  * 人工解除告警（操作者显式命令，供 OLED 侧二次确认后调用）。
@@ -245,5 +296,12 @@ uint32_t fall_gyro_magnitude2(const int16_t gyro[3]); /* 单位 LSB² */
  * 与其溢出回绕不如钉在上限。协议见 docs/团队协作规范与接口契约.md §4.3。
  */
 uint16_t fall_acc_mag_centi_g(const int16_t acc[3]);
+
+/*
+ * 逐位整数开方（fall_acc_mag_centi_g 的实现基础）。导出给显示等模块
+ * 复用（oled_display 的角速度合成 |w| 计算同用此函数），避免同一算法
+ * 多份拷贝各自漂移。纯整数、无浮点，输入输出均 LSB/LSB²。
+ */
+uint32_t fall_isqrt_u32(uint32_t v);
 
 #endif /* FALL_CORE_H */

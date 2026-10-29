@@ -25,6 +25,9 @@ static const char *TAG = "SET";
 volatile uint16_t g_fpga_tel_period_ms = 1000u;
 
 static ui_settings_t s_cfg;
+/* NVS 中已持久化的值（增量写依据）：init 时与读出值同步，
+ * 每次成功 commit 后更新为 s_cfg，settings_save 据此只写"脏"key。 */
+static ui_settings_t s_saved;
 static bool s_ready = false;
 
 /* 恢复出厂两步确认：首次按 D 进入待确认，3s 内再按 D 才执行 */
@@ -87,6 +90,7 @@ esp_err_t settings_init(void)
         ESP_LOGW(TAG, "nvs open failed (%s), using defaults",
                  esp_err_to_name(err));
     }
+    s_saved = s_cfg;    /* 持久化影子与当前值同步：首次 save 前无脏项 */
     s_ready = true;
     return ESP_OK;
 }
@@ -98,23 +102,47 @@ static void settings_save(void)
         return;
     }
     /*
-     * 逐项写入并检查返回值：NVS 空间不足或 flash 异常时若静默失败，
-     * 表现为"设置改了但下次上电又回到旧值"，很难排查。
+     * 增量写：只写与 NVS 中已持久化值（s_saved）不同的 key。
+     * 旧实现每次调节都写满全部 8 个 key——NVS 的每次 set 都会触发
+     * flash 擦写，全量写把磨损放大到 8 倍。s_saved 在 init 时与读出值
+     * 同步、成功 commit 后更新，语义等价于"只写脏项"。
+     * （nvs_set_* 对写入相同值也照样执行擦写，不能靠它幂等省写。）
+     * 逐项检查返回值的理由不变：静默失败表现为"设置改了但下次上电
+     * 又回到旧值"，很难排查。
      */
     esp_err_t e = ESP_OK;
-    e = (e != ESP_OK) ? e : nvs_set_u8(h, "contrast", s_cfg.contrast);
-    e = (e != ESP_OK) ? e : nvs_set_u8(h, "pageauto", s_cfg.page_auto);
-    e = (e != ESP_OK) ? e : nvs_set_u16(h, "cyclems", s_cfg.cycle_ms);
-    e = (e != ESP_OK) ? e : nvs_set_u16(h, "telms", s_cfg.tel_ms);
-    e = (e != ESP_OK) ? e : nvs_set_u8(h, "pendb", s_cfg.pend_beep);
-    e = (e != ESP_OK) ? e : nvs_set_u8(h, "buzen", s_cfg.buzzer_en);
-    e = (e != ESP_OK) ? e : nvs_set_u8(h, "tonesel", s_cfg.tone_sel);
-    e = (e != ESP_OK) ? e : nvs_set_u8(h, "xshift", s_cfg.x_shift);
-    if (e == ESP_OK) {
-        e = nvs_commit(h);
+    if (s_cfg.contrast  != s_saved.contrast) {
+        e = (e != ESP_OK) ? e : nvs_set_u8(h, "contrast", s_cfg.contrast);
     }
-    if (e != ESP_OK) {
+    if (s_cfg.page_auto != s_saved.page_auto) {
+        e = (e != ESP_OK) ? e : nvs_set_u8(h, "pageauto", s_cfg.page_auto);
+    }
+    if (s_cfg.cycle_ms  != s_saved.cycle_ms) {
+        e = (e != ESP_OK) ? e : nvs_set_u16(h, "cyclems", s_cfg.cycle_ms);
+    }
+    if (s_cfg.tel_ms    != s_saved.tel_ms) {
+        e = (e != ESP_OK) ? e : nvs_set_u16(h, "telms", s_cfg.tel_ms);
+    }
+    if (s_cfg.pend_beep != s_saved.pend_beep) {
+        e = (e != ESP_OK) ? e : nvs_set_u8(h, "pendb", s_cfg.pend_beep);
+    }
+    if (s_cfg.buzzer_en != s_saved.buzzer_en) {
+        e = (e != ESP_OK) ? e : nvs_set_u8(h, "buzen", s_cfg.buzzer_en);
+    }
+    if (s_cfg.tone_sel  != s_saved.tone_sel) {
+        e = (e != ESP_OK) ? e : nvs_set_u8(h, "tonesel", s_cfg.tone_sel);
+    }
+    if (s_cfg.x_shift   != s_saved.x_shift) {
+        e = (e != ESP_OK) ? e : nvs_set_u8(h, "xshift", s_cfg.x_shift);
+    }
+    if (e == ESP_OK) {
+        e = nvs_commit(h);   /* 无脏项时为空事务，不触碰 flash */
+    }
+    if (e == ESP_OK) {
+        s_saved = s_cfg;
+    } else {
         ESP_LOGW(TAG, "settings save failed: %s", esp_err_to_name(e));
+        /* s_saved 不更新：下次 save 自动重试仍未落盘的脏项 */
     }
     nvs_close(h);
 }
@@ -266,15 +294,15 @@ void settings_get_item_text(uint8_t item, char *name, size_t nlen,
     }
     switch (item) {
         case 0: snprintf(val, vlen, "%u", (unsigned)s_cfg.contrast); break;
-        case 1: snprintf(val, vlen, s_cfg.page_auto ? "ON" : "OFF"); break;
+        case 1: snprintf(val, vlen, "%s", s_cfg.page_auto ? "ON" : "OFF"); break;
         case 2: snprintf(val, vlen, "%us", (unsigned)(s_cfg.cycle_ms / 1000u)); break;
         case 3: snprintf(val, vlen, "%ums", (unsigned)s_cfg.tel_ms); break;
-        case 4: snprintf(val, vlen, s_cfg.pend_beep ? "ON" : "OFF"); break;
-        case 5: snprintf(val, vlen, s_cfg.buzzer_en ? "ON" : "MUTE"); break;
-        case 6: snprintf(val, vlen,
+        case 4: snprintf(val, vlen, "%s", s_cfg.pend_beep ? "ON" : "OFF"); break;
+        case 5: snprintf(val, vlen, "%s", s_cfg.buzzer_en ? "ON" : "MUTE"); break;
+        case 6: snprintf(val, vlen, "%s",
                          (s_cfg.tone_sel == 0u) ? "LOW" :
                          (s_cfg.tone_sel == 1u) ? "MID" : "HIGH"); break;
-        case 7: snprintf(val, vlen, reset_armed() ? "AGAIN!" : "PRESS+"); break;
+        case 7: snprintf(val, vlen, "%s", reset_armed() ? "AGAIN!" : "PRESS+"); break;
         case 8: snprintf(val, vlen, "%upx", (unsigned)s_cfg.x_shift); break;
         default: break;
     }

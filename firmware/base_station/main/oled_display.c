@@ -1122,7 +1122,10 @@ static void fmt_q(char *buf, size_t len, int32_t v, int32_t scale)
 void oled_show_telemetry(const oled_status_t *s,
                          const uint8_t *mag_hist, uint8_t hist_n)
 {
-    char   row[24];
+    /* 32B：最长行 "w=999.9dps BAD 4294967295" 的最坏类型宽度 + NUL
+     * （row[24] 时该行触发 -Werror=format-truncation；显示宽度仍由
+     * oled_draw_row 按屏宽截断，缓冲区放宽不改变输出内容） */
+    char   row[32];
     char   q[12];
     uint8_t i;
     int     fresh = (int)s->data_fresh;
@@ -1160,19 +1163,16 @@ void oled_show_telemetry(const oled_status_t *s,
     }
     oled_draw_row(4, row);
 
-    /* 角速度合成（0.1dps）：|w| = isqrt(gx^2+gy^2+gz^2) 整数开方 */
+    /* 角速度合成（0.1dps）：|w| = isqrt(gx^2+gy^2+gz^2) 整数开方
+     * （复用 fall_core 的 fall_isqrt_u32，同算法不存两份拷贝） */
     if (fresh) {
         int32_t gx = s->gyro[0], gy = s->gyro[1], gz = s->gyro[2];
-        int32_t g2 = gx * gx + gy * gy + gz * gz;
-        int32_t r = 0, bit = 1 << 30;
-        int32_t wx;
-        while (bit > g2) bit >>= 2;
-        while (bit != 0) {
-            if (g2 >= r + bit) { g2 -= r + bit; r = (r >> 1) + bit; }
-            else               { r >>= 1; }
-            bit >>= 2;
-        }
-        wx = (int32_t)(((int64_t)r * 10000L) / 16384L);   /* 0.1dps */
+        int32_t g2 = gx * gx + gy * gy + gz * gz;   /* < 3.3e9，u32 安全 */
+        int32_t r  = (int32_t)fall_isqrt_u32((uint32_t)g2);
+        int32_t wx = (int32_t)(((int64_t)r * 10000L) / 16384L);   /* 0.1dps */
+        /* 物理上限 |w| ≈ 346.4dps（三轴各 32767 LSB），显示限幅 999.9 */
+        if (wx < 0)    { wx = 0; }
+        if (wx > 9999) { wx = 9999; }
         snprintf(row, sizeof(row), "w=%ld.%01lddps BAD %lu",
                  (long)(wx / 10), (long)(wx % 10),
                  (unsigned long)s->frames_bad);

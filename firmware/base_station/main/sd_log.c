@@ -367,7 +367,12 @@ bool sd_log_ready(void)
  *
  * 稳定性约束：
  *   1) 连续 SD_PROBE_FAIL_MAX 次失败才降级（防单次 SPI 抖动误判）；
- *   2) 降级后周期性尝试重新挂载，卡插回即自动恢复。
+ *   2) 降级后周期性尝试重新挂载，卡插回即自动恢复；
+ *   3) 降级后的重挂载带指数退避：全量 sd_log_init()（SPI 总线初始化 +
+ *      挂载尝试）失败一次要耗几十至上百毫秒，无卡时若每个探活周期
+ *      （约 5s）都做一遍，会周期性阻塞调用方（UI 任务）。前 3 次仍
+ *      逐周期快速重试（应对"刚降级就插回"），之后按 4/8/16 个周期
+ *      退避封顶（最长约 80s 一次），任何一次成功立即恢复逐周期探活。
  *
  * 由 UI 任务低频（约 5s）调用。返回 true = 记录功能当前可用。
  */
@@ -386,14 +391,34 @@ static bool sd_card_alive(void)
 
 bool sd_log_probe(void)
 {
-    static int fail_cnt = 0;
+    static int fail_cnt   = 0;   /* 连续扇区读失败计数（降级判据） */
+    static int init_fails = 0;   /* 降级后连续重挂载失败次数 */
+    static int defer_cnt  = 0;   /* 退避期：还需跳过的探活周期数 */
 
-    /* --- 已降级：尝试重新挂载（卡插回后自动恢复） --- */
+    /* --- 已降级：指数退避的重新挂载尝试（卡插回后自动恢复） --- */
     if (!s_ready || s_fp == NULL) {
+        int shift;
+
+        if (defer_cnt > 0) {
+            defer_cnt--;
+            return false;
+        }
         if (sd_log_init() == ESP_OK) {
-            fail_cnt = 0;
+            fail_cnt   = 0;
+            init_fails = 0;
+            defer_cnt  = 0;
             ESP_LOGI(TAG, "SD recovered: logging re-enabled");
             return true;
+        }
+        init_fails++;
+        if (init_fails <= 3) {
+            defer_cnt = 0;                       /* 前 3 次逐周期重试 */
+        } else {
+            shift = init_fails - 4;
+            if (shift > 2) {
+                shift = 2;                       /* 4/8/16 周期封顶 */
+            }
+            defer_cnt = 4 << shift;
         }
         return false;
     }
@@ -409,6 +434,8 @@ bool sd_log_probe(void)
         fclose(s_fp);
         s_fp    = NULL;
         s_ready = false;
+        init_fails = 0;                      /* 重挂载从快速重试开始 */
+        defer_cnt  = 0;
         return false;
     }
 

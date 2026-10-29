@@ -42,6 +42,13 @@
  */
 #include "../../main/ui_proto.c"
 
+/*
+ * CSI 子载波方差统计同样直接编入（2026-10-25 新增，纯 C99）。
+ * 目的：锁定 csi_stats 的方差公式、ready 状态机、commit 节流与
+ * 10 帧滑窗环形覆盖语义（场景 21/22），与 fall_core 同一纪律。
+ */
+#include "../../main/csi_stats.c"
+
 /* --------------------------------------------------------------------------
  * 期望迁移序列比对
  * -------------------------------------------------------------------------- */
@@ -770,6 +777,162 @@ int main(int argc, char **argv)
 
         if (ok) {
             printf("  [PASS] manual clear bounds ok\n");
+        } else {
+            failures++;
+        }
+        ran++;
+        printf("\n");
+    }
+
+#if POSTURE_CHECK_ENABLE
+    /*
+     * ======================================================================
+     * 以下为 2026-10-25 新增：姿态门场景组（仅姿态门构建参与，见头注）
+     *   场景 18/19 的数据前 2.1s 为直立静止，竖直参考在此期间自动校准；
+     *   场景 20 无校准期，验证未校准 fail-open 与门关闭逐位一致。
+     * ======================================================================
+     */
+
+    /* 场景 18：校准后跌倒躺平 —— 躺平角 > 60°，门放行 -> CONFIRMED */
+    {
+        fall_state_t exp[] = { FALL_STATE_IDLE, FALL_STATE_WALK,
+                               FALL_STATE_PENDING, FALL_STATE_CONFIRMED };
+        printf("[18] scene: posture_fall_lying (calibrated, gate allows)\n");
+        if (!run_scene("data/posture_fall_lying.bin",
+                       "calibrated fall to lying still CONFIRMS",
+                       exp, 4, dt_ms, 231, 0)) {
+            failures++;
+        }
+        ran++;
+        printf("\n");
+    }
+
+    /* 场景 19：校准后快速坐下 —— 坐姿 ≈ 直立（角 < 60°），门拦截不报警 */
+    {
+        fall_state_t exp[] = { FALL_STATE_IDLE, FALL_STATE_PENDING,
+                               FALL_STATE_IDLE };
+        printf("[19] scene: posture_fast_sit (gate blocks false alarm)\n");
+        if (!run_scene("data/posture_fast_sit.bin",
+                       "hard sit-down stays upright, gate blocks alarm",
+                       exp, 3, dt_ms, 311, 0)) {
+            failures++;
+        }
+        ran++;
+        printf("\n");
+    }
+
+    /* 场景 20：未校准 fail-open —— 行为与门关闭完全一致 */
+    {
+        fall_state_t exp[] = { FALL_STATE_IDLE, FALL_STATE_WALK,
+                               FALL_STATE_PENDING, FALL_STATE_CONFIRMED };
+        printf("[20] scene: posture_uncalib_fall (fail-open parity)\n");
+        if (!run_scene("data/posture_uncalib_fall.bin",
+                       "uncalibrated fall behaves exactly like gate-off",
+                       exp, 4, dt_ms, 126, 0)) {
+            failures++;
+        }
+        ran++;
+        printf("\n");
+    }
+#endif /* POSTURE_CHECK_ENABLE */
+
+    /*
+     * 场景 21：csi_stats 单帧方差 + ready/节流语义
+     *   a) 单帧 |h| = {3,4,5,0} -> var = (4*50 - 12^2)/16 = 3.5 -> 整数 3；
+     *   b) 无新快照重复 commit 不重复入窗（UDP 包率 = 入窗率）；
+     *   c) 第二帧 |h| = {3,8} -> var = (2*73 - 11^2)/4 = 6.25 -> 6，
+     *      两帧窗口均值 (3+6)/2 = 4；
+     *   d) 非法输入（NULL / n=0 / n>上限）必须被拒绝。
+     */
+    {
+        int8_t iq1[8] = { 3, 0, 4, 0, 5, 0, 0, 0 };
+        int8_t iq2[4] = { 3, 0, 8, 0 };
+        uint32_t v1, v2;
+        int ok = 1;
+
+        printf("[21] csi_stats single-frame variance + ready\n");
+
+        csi_stats_reset();
+        if (!csi_stats_accumulate(iq1, 4)) {
+            printf("  ASSERT FAILED: valid frame rejected\n");
+            ok = 0;
+        }
+        csi_stats_commit();
+        v1 = csi_stats_variance();
+        printf("  var(3,4,5,0) = %u (expect 3)\n", (unsigned)v1);
+        if (v1 != 3u || !csi_stats_ready()) {
+            printf("  ASSERT FAILED: variance/ready wrong\n");
+            ok = 0;
+        }
+
+        /* 无新快照的裸 commit：不得把旧值重复入窗 */
+        csi_stats_commit();
+        printf("  bare commit: no duplicate push\n");
+
+        if (!csi_stats_accumulate(iq2, 2)) {
+            printf("  ASSERT FAILED: second frame rejected\n");
+            ok = 0;
+        }
+        csi_stats_commit();
+        v2 = csi_stats_variance();
+        printf("  window avg(3,6) = %u (expect 4)\n", (unsigned)v2);
+        if (v2 != 4u) {
+            printf("  ASSERT FAILED: window average wrong\n");
+            ok = 0;
+        }
+
+        if (csi_stats_accumulate(NULL, 4) ||
+            csi_stats_accumulate(iq1, 0) ||
+            csi_stats_accumulate(iq1, CSI_STATS_MAX_SUB + 1)) {
+            printf("  ASSERT FAILED: invalid input accepted\n");
+            ok = 0;
+        } else {
+            printf("  invalid inputs rejected (NULL/n=0/n>MAX)\n");
+        }
+
+        if (ok) {
+            printf("  [PASS] variance math + ready/throttle semantics\n");
+        } else {
+            failures++;
+        }
+        ran++;
+        printf("\n");
+    }
+
+    /*
+     * 场景 22：10 帧滑窗环形覆盖
+     *   帧号 i（2..26，步进 2）的方差为 i^2/4（幅度 {i,i,0,0}）。
+     *   喂 13 帧后窗口应只含最近 10 帧（i=8..26，方差 16..169），
+     *   整数均值 = 805/10 = 80；若覆盖失效（保留最旧 10 帧），均值为 38。
+     */
+    {
+        uint32_t v;
+        int ok = 1;
+        int k;
+
+        printf("[22] csi_stats ring window overwrite\n");
+        csi_stats_reset();
+        for (k = 1; k <= 13; k++) {
+            int8_t iq[8];
+            int amp = 2 * k;
+
+            iq[0] = (int8_t)amp; iq[1] = 0;
+            iq[2] = (int8_t)amp; iq[3] = 0;
+            iq[4] = 0;           iq[5] = 0;
+            iq[6] = 0;           iq[7] = 0;
+            if (!csi_stats_accumulate(iq, 4)) {
+                ok = 0;
+            }
+            csi_stats_commit();
+        }
+        v = csi_stats_variance();
+        if (v != 80u || !csi_stats_ready()) {
+            printf("  ASSERT FAILED: window avg=%u (expect 80 = last-10 mean; "
+                   "38 would mean no overwrite)\n", (unsigned)v);
+            ok = 0;
+        }
+        if (ok) {
+            printf("  [PASS] ring overwrites oldest frame\n");
         } else {
             failures++;
         }

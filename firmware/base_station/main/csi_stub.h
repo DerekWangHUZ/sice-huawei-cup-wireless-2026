@@ -1,23 +1,32 @@
 /*
- * csi_stub.h -- CSI（Channel State Information）占位接口
+ * csi_stub.h -- CSI（Channel State Information）对外接口
  *
- * 本期说明：
- *   真实 CSI 提取本期【不做】——需要穿戴端在场持续发包才能采集到有意义
- *   的空间多径特征，且基站侧 CSI 回调要与 Wi-Fi 驱动深度耦合。
- *   因此这里只提供稳定接口 + 占位实现，保证 S3 主程序可以完整编译、
- *   完整跑通主链路，后续接入真实 CSI 时只需替换本文件实现。
+ * 实现状态（2026-10-25 更新）：
+ *   真实提取【通路已实现、默认未启用】——csi_real.c + csi_stats.c 完成
+ *   了"WiFi CSI 回调 -> 子载波幅度方差滑窗 -> csi_get_variance()"的完整
+ *   数据通路，并由 main/CMakeLists.txt 的 BS_CSI_IMPL 在编译期选择：
+ *     stub（默认）：本文件配套的 csi_stub.c，行为与历史版本完全一致；
+ *     real        ：csi_real.c，SoftAP 侧采集 LLTF CSI（穿戴端 STA 的
+ *                   50Hz 上行包即采集源，回调只对本机收发的帧触发）。
  *
- * 真实实现接入点（TODO，留给有穿戴端在场的阶段）：
- *   1) 在 wifi 初始化时 esp_wifi_set_csi(true) 开启 CSI 采集；
- *   2) 用 esp_wifi_set_csi_config() 配置采集参数（LLTF/HT-LTF/STBC 等）；
- *   3) 注册 esp_wifi_set_csi_rx_cb() 回调，在回调里拿到 wifi_csi_info_t；
- *   4) 从 csi_info->buf 取出子载波复数对（实部+虚部），算幅度；
- *   5) 对 64 个子载波求幅度方差，即本接口承诺的 csi_get_variance()；
- *   6) 把方差喂给 fall_detector 作为"跌倒后环境扰动消失"的辅助判据
- *      （对应契约 §2.2 第三段：CSI 扰动方差 < sigma_csi）。
+ * 剩余为上机事项（本仓库纯离线验证，未上机）：
+ *   1) 确认 S3 AP 模式下 CSI 回调确实触发（csi_ready() 变 true）；
+ *   2) 标定 sigma_csi：采集"静止/活动/跌倒躺平"三种状态的
+ *      CSI_Variance 序列，取分界值填 fall_core.h 的 CSI_FALL_VAR_MAX；
+ *   3) 把 fall_core.h 的 CSI_JUDGE_ENABLE 置 1 启用辅助判据
+ *      （契约 §2.2 第三段：跌倒后扰动方差 < sigma_csi）。
+ *
+ * 历史接入点说明（原 6 步 TODO，现由 csi_real.c/csi_stats.c 落实）：
+ *   1) esp_wifi_set_csi(true) 开启采集            -> csi_init()
+ *   2) esp_wifi_set_csi_config() 配置(LLTF only)   -> csi_init()
+ *   3) esp_wifi_set_csi_rx_cb() 注册回调           -> csi_init()
+ *   4) csi_info->buf 取子载波复数对算幅度          -> csi_stats_accumulate()
+ *   5) 64 子载波幅度方差                            -> csi_stats_commit()
+ *   6) 方差喂给 fall_detector 作辅助判据           -> fall_detector_set_csi()
  *
  * 注意：CSI 回调运行在 Wi-Fi 驱动上下文，只能做轻量计算，
- *       方差统计建议只累加，取用在本接口的 getter 里做除法。
+ *       方差统计只累加（csi_stats_accumulate），除法在 getter 里做
+ *       （csi_stats_commit / csi_stats_variance）。
  */
 
 #ifndef CSI_STUB_H
@@ -26,8 +35,17 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "esp_err.h"
+
+/*
+ * 初始化 CSI 采集（esp_wifi_start() 成功后调用一次）。
+ * stub：空操作返回 ESP_OK；real：配置并注册 WiFi CSI 回调。
+ * 失败时主程序仅记日志降级（CSI 缺失不影响 IMU 主判据）。
+ */
+esp_err_t csi_init(void);
+
 /* 每收到一个姿态 UDP 包调用一次。
-   真实实现：在此触发一次 CSI 快照读取 / 更新统计量。 */
+   真实实现：在此触发一次 CSI 快照结算 / 更新统计量。 */
 void csi_feed_packet(void);
 
 /* 获取当前 CSI 特征（64 子载波幅度方差）。

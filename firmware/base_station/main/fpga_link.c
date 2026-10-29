@@ -16,6 +16,7 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -124,13 +125,20 @@ esp_err_t fpga_link_send_cmd_ex(uint8_t cmd, uint8_t p1, uint16_t p2, bool verbo
         return ESP_ERR_TIMEOUT;
     }
 
-    /* 帧间隔保护：不足则忙等补足（8 字节 @115200 约 0.7ms，等待极短）。
-     * 忙等在互斥量内进行，保证多任务并发下帧间隔仍然成立。 */
+    /*
+     * 帧间隔保护：距上次发送不足 FPGA_TX_GAP_MS 则补足等待。
+     * 等待仍在互斥量内进行——帧间隔是多任务共享的全局约束，不能让
+     * 别的任务插队；与旧实现的差别只是把"持锁自旋烧 CPU"换成
+     * 每轮 vTaskDelay(1) 睡 1 tick 后重算剩余时间（8 字节 @115200
+     * 约 0.7ms + 2ms 间隔，等待本身极短，最多多睡一个 tick，
+     * 对 FPGA 侧"至少间隔 gap"的语义无影响——只会更长不会更短）。
+     */
     if (s_last_tx_us != 0) {
-        int64_t now_us = esp_timer_get_time();
-        int64_t gap_us = (int64_t)FPGA_TX_GAP_MS * 1000;
-        while ((now_us - s_last_tx_us) < gap_us) {
-            now_us = esp_timer_get_time();
+        int64_t gap_us     = (int64_t)FPGA_TX_GAP_MS * 1000;
+        int64_t remain_us  = s_last_tx_us + gap_us - esp_timer_get_time();
+        while (remain_us > 0) {
+            vTaskDelay(1);
+            remain_us = s_last_tx_us + gap_us - esp_timer_get_time();
         }
     }
 

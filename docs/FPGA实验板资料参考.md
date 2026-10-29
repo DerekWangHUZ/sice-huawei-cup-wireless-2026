@@ -2,7 +2,7 @@
 
 > 本文档汇总《数字系统实验 II》课程所用 **Artix-7 实验板** 的完整引脚与片上资源约束，
 > 全部来自《数字系统实验 II》课程各实验的官方 XDC / 源文件，
-> 并经板卡实测交叉校验。本仓库 FPGA 工程（`firmware/coprocessor`）的引脚约束以本文为参考。
+> 并与板卡实际行为核对。本仓库 FPGA 工程（`firmware/coprocessor`）的引脚约束以本文为参考。
 
 ---
 
@@ -33,9 +33,9 @@ set_property IOSTANDARD  LVCMOS33 [get_ports rst_n]
 set_property PULLUP true [get_ports rst_n]
 ```
 
-**实测注意**：`top.v` 若直接依赖 `rst_n` 而不开内部上拉，下载成功（`End of startup status: HIGH`）但 LED 全不亮 ——
-原因是 `T9` 未被拉高，设计一直处于异步复位。加上 `PULLUP true` 即可正常工作。
-**结论：rst_n 必须开内部上拉，或在逻辑里处理成可选。**
+**约束要求**：若设计依赖 `rst_n` 而未启用内部上拉，会出现下载成功
+（`End of startup status: HIGH`）但 LED 全不亮的现象——`T9` 未被拉高，
+设计持续处于异步复位。**rst_n 必须开内部上拉（或在逻辑里处理成可选）。**
 
 ---
 
@@ -54,11 +54,11 @@ set_property PULLUP true [get_ports rst_n]
 
 - 来源：课程《第六周 实验五（２）矩阵键盘按键控制 LED》约束文件（完整 16 颗）。
   课程 master 资源文件里只示范了 `Q[0..3]` + `CO`(N6)，其余以注释形式给出，与上面 16 颗完全一致。
-- **极性**：实测为**高电平点亮**（直接驱动，非反相）。证据：`assign led = cnt[24:9]` 时
-  `led[0..10]`（对应 `cnt[9..19]`，47 Hz~48.8 kHz）肉眼“常亮”，`led[11..15]` 随比特位升高频率递减 →
-  说明每个 `led[k]` 直接接一个计数器高位，1=亮。
-- ⚠️ **本板硬件缺陷（实测）**：`led[15]`（引脚 **M1**）在这块板子上**物理不亮**——
-  同一份 1Hz 同步闪烁程序下 15 颗正常闪、唯独 M1 死暗。属于板卡个体硬件问题，**与工程/约束/下载无关**，验收时忽略即可。
+- **极性**：**高电平点亮**（直接驱动，非反相）。验证方法：`assign led = cnt[24:9]` 时
+  `led[0..10]`（对应 `cnt[9..19]`，47 Hz~48.8 kHz）肉眼"常亮"，`led[11..15]` 随比特位升高频率递减，
+  即每个 `led[k]` 直接接一个计数器高位，1=亮。
+- ⚠️ **板卡特性**：`led[15]`（引脚 **M1**）在本板**不点亮**——
+  1Hz 同步闪烁程序下其余 15 颗正常闪、唯独 M1 无输出。属板卡个体硬件问题，**与工程/约束/下载无关**，验收时忽略即可。
 - **本项目使用约定**：
   - 板上共 **17 颗 LED**（丝印 LED0~LED16）。课程 XDC 只提供 16 个引脚映射，
     **丝印 LED16 没有引脚映射**，任何比特流都不会驱动它——它不亮是"没接"而非"坏了"。
@@ -98,7 +98,7 @@ set_property PULLUP true [get_ports rst_n]
 - ⚠️ **上拉/下拉不一致（官方两处写法不同）**：
   - 电子琴 XDC：`set_property PULLUP true [get_ports {col[3..0]}]`（列线上拉）
   - master 资源文件：`set_property PULLDOWN true [get_ports {col[3..0]}]`（列线下拉）
-  - 实际用哪种取决于板子矩阵接法，尚无定论；**建议按键盘扫描惯例“列线输出、行线输入+上拉”对接，并在代码中做消抖**。
+  - 实际用哪种取决于板子矩阵接法；**建议按键盘扫描惯例“列线输出、行线输入+上拉”对接，并在代码中做消抖**。
 
 ---
 
@@ -123,7 +123,7 @@ set_property PULLUP true [get_ports rst_n]
   引脚无冲突（本工程不使用 ain 信号），可安全作为拨码输入。
 - 本工程使用 `sw[1]`(T8) = 演示模式总开关、`sw[2]`(T7) = 本地硬静音，
   均开内部 PULLUP；其余 9 位拨码留作扩展，未约束。
-- 极性（拨上=1 还是拨下=1）需上板首验；若相反，在 RTL 取反一处即可。
+- 极性（拨上=1 还是拨下=1）以实板为准；若相反，在 RTL 取反一处即可。
 
 ---
 
@@ -172,13 +172,13 @@ set_property IOSTANDARD  LVCMOS33 [get_ports buzzer]
 
 ---
 
-## 9. 板卡实测结论
+## 9. 板卡特性与验证方法
 
 1. **下载成功标志**：Vivado `Program Device` 日志末尾出现 `End of startup status: HIGH` ⇒ 比特流已配置、DONE 拉高、设计在运行。
 2. **时钟验证法**：把 25 位计数器 `cnt` 的高 16 位直接接 `led`（`assign led = cnt[24:9]`），
-   若 LED0~10 常亮、11~15 频率递减 ⇒ 证明 50MHz/D4 时钟在跑、led 引脚全对。
-3. **坏 LED**：`led[15]=M1` 在本板物理不亮（见 §3 警告），非工程问题。
-4. **复位坑**：`rst_n`(T9) 不开内部上拉时设计卡复位，LED 全灭；加 `PULLUP true` 解决。
+   若 LED0~10 常亮、11~15 频率递减 ⇒ 50MHz/D4 时钟在跑、led 引脚全对。
+3. **`led[15]`=M1 在本板不点亮**（见 §3），属板卡个体硬件问题，非工程问题。
+4. **复位要求**：`rst_n`(T9) 必须启用内部上拉，否则设计持续处于复位、LED 全灭。
 
 ---
 
@@ -199,12 +199,12 @@ set_property IOSTANDARD  LVCMOS33 [get_ports buzzer]
   后者内部会先加载 Vivado 自带的 SPI 桥接位流
   （`spi_xc7a35t_pullnone.bit`，位于 Vivado 安装目录
   `data/xicom/cfgmem/`），这是 JTAG 间接访问 Flash 的必要前置步骤；
-  GUI 会自动完成这一步，手写 Tcl 时容易漏掉（漏掉时报的错是
-  `[Labtools 27-3347] Failure to set flash parameters`，该提示有误导性，
-  真实原因见 `readback_hw_cfgmem` 的 `27-3138 indirect programming
-  bitstream was not found`）。
-- **改 RTL 后必须重新固化**，否则上电运行的仍是 Flash 中原有比特流；只想立刻看现象可继续用
-  JTAG 下载（掉电即失，不影响 Flash 内容）。
+  GUI 会自动完成这一步，手写 Tcl 时须显式加载，遗漏时报
+  `[Labtools 27-3347] Failure to set flash parameters`，其根因见
+  `readback_hw_cfgmem` 的 `27-3138 indirect programming
+  bitstream was not found`。
+- **改 RTL 后必须重新固化**，否则上电运行的仍是 Flash 中原有比特流；临时验证
+  可用 JTAG 下载（掉电即失，不影响 Flash 内容）。
 
 ### ⚠️ 板级特性：上电不会自动触发配置
 
@@ -212,40 +212,40 @@ set_property IOSTANDARD  LVCMOS33 [get_ports buzzer]
 `DONE` 保持为 0，数码管/LED/蜂鸣器全无反应。**手动按一下板上 CONFIG 按钮**，
 立即正常启动并运行 Flash 中的设计。
 
-**这个现象本身已经排除了以下可能**（按下 CONFIG 能起来即可证明）：
+**以下因素与该现象无关**（按下 CONFIG 能启动即可佐证）：
 
-| 已排除 | 依据 |
+| 无关因素 | 依据 |
 |---|---|
 | Flash 内容/比特流有问题 | 按 CONFIG 能正常加载运行 |
 | 启动模式（MSEL）不对 | 按 CONFIG 说明确实在读 SPI Flash |
 | 烧写方式/工具链有问题 | `Erase`/`Program`/`Verify` 全部成功，读回校验一致 |
 | mcs 格式有问题 | 与 Vivado 自带样例 `ac701_test.mcs` 结构逐字段一致 |
 
-**唯一失效的环节是"上电瞬间的自动触发"**。CONFIG 按钮接的是 FPGA 的
+**失效环节仅在于"上电瞬间的自动触发"**。CONFIG 按钮接的是 FPGA 的
 `PROGRAM_B`（低有效配置复位）；它能手动生效、上电却不生效，指向板级的
 上电复位电路/电源上升沿问题，属**硬件层面**。
 
-**这些做法不能解决问题**：
+**以下设置与上电触发无关**：
 
 - 在 XDC 中设置 `BITSTREAM.CONFIG.PROGPIN/INITPIN/DONEPIN = Pull-up`
-  （以 FPGA 内部弱上拉替代板上外部上拉）——无效。
+  （以 FPGA 内部弱上拉替代板上外部上拉）。
 - `CFGBVS` 与 `CONFIG_VOLTAGE` 属性（该设置用于消除 DRC 的
   `CFGBVS-1` 告警，与上电触发无关）。
 
-**该板当前行为：上电后必须按一次 CONFIG 才会从 Flash 启动。**
-该现象指向板级上电复位电路/电源上升沿，属**硬件层面**，软件侧无法规避。
+**本板行为：上电后必须按一次 CONFIG 才会从 Flash 启动。**
+该现象属板级上电复位电路/电源上升沿特性，**硬件层面**，软件侧无法规避。
 
-**当前可行的绕过方式**（均需人工或额外硬件）：
+**可行的应对方式**（均需人工或额外硬件）：
 
 1. 上电后按一次 CONFIG 按钮（最简单的方式）。
 2. 用 `program_bit.tcl` 经 JTAG 下载（需要电脑，不满足"脱离电脑"要求）。
 
-**若要实现全自动而又不动配置电路**，可考虑用 ESP32-S3 的一个空闲 GPIO
+**若要实现全自动而又不动配置电路**，可用 ESP32-S3 的一个空闲 GPIO
 接 FPGA 的 `PROGRAM_B`，上电后由 S3 主动拉低 100ms 再释放，等效于按一次
-CONFIG。此方案需增加一根飞线，**未采用**。
+CONFIG。此方案需增加一根飞线，且需占用 S3 的一个空闲 GPIO。
 
 - 烧写失败不会损坏 JTAG 通路：配置 Flash 内容异常时 FPGA 只是不启动，
-  仍可用 `program_bit.tcl` 重新下载恢复现场。
+  仍可用 `program_bit.tcl` 重新下载比特流。
 
 ---
 

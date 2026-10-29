@@ -12,6 +12,14 @@
 
 #include "board_config.h"
 
+/*
+ * 摄像头启动开关（对应 README §4/§7/§11）：
+ *   1（默认）= 上电初始化摄像头（三次自检）+ 闪光灯 + 网页服务，全功能；
+ *   0 = 跳过摄像头相关初始化，仅保留 MPU 50Hz 推流与 8889 抓拍命令
+ *       接收（校验+日志，不取图），用于隔离摄像头链路问题或最小化运行。
+ */
+#define CAMERA_BOOT_ENABLE 1
+
 // ESP32-CAM 穿戴端固件：接入 ESP32-S3 基站 SoftAP，
 // 以 50Hz 推送 18 字节原始 IMU 帧，并支持基站下发的异步抓拍命令。
 const char *ssid = "CSI_FALL_AP";
@@ -62,6 +70,13 @@ volatile uint32_t g_captureCmdRx  = 0;
 volatile uint32_t g_captureReject = 0;
 volatile uint32_t g_captureOk     = 0;
 volatile uint32_t g_captureFail   = 0;
+
+/*
+ * 姿态帧 UDP 发送失败计数（write/endPacket 失败或 beginPacket 拒绝）。
+ * 失败不递增 packetSequence（序号严格等于成功发出的帧数），
+ * 只累计在此，随 200ms 诊断行汇报，不逐帧刷屏。
+ */
+volatile uint32_t g_udpSendFail = 0;
 bool captureBusy = false;
 bool captureWaitingForLight = false;
 unsigned long captureLightReadyTime = 0;
@@ -173,13 +188,22 @@ void sendImuPacket(
    * UDP 无连接，丢一帧由基站掉线保护兜底，不必重发。
    * 但 beginPacket 在 socket 未就绪时返回 0，此时继续 write/endPacket
    * 无意义且会掩盖故障，因此判一下。
+   * 三步全部成功才递增 packetSequence：序号严格等于"成功发出的帧数"，
+   * 失败只累计 g_udpSendFail（随 200ms 诊断行汇报），不逐帧刷屏。
    */
+  bool sentOk = false;
   if (udp.beginPacket(receiverIP, receiverPort) != 0) {
-    udp.write(packet, sizeof(packet));
-    udp.endPacket();
+    size_t written = udp.write(packet, sizeof(packet));
+    if (written == sizeof(packet) && udp.endPacket() != 0) {
+      sentOk = true;
+    }
   }
 
-  packetSequence++;
+  if (sentOk) {
+    packetSequence++;
+  } else {
+    g_udpSendFail++;
+  }
 }
 
 bool setupMpu() {
@@ -252,10 +276,8 @@ void checkFall(
 
   unsigned long now = millis();
 
-  // 第一阶段：检测剧烈冲击或者快速旋转
-  bool strongMotion =
-      accelerationMagnitude > 2.2 ||
-      gyroMagnitude > 180.0;
+  // 第一阶段：剧烈冲击（与基站一致：仅合加速度判据）
+  bool strongMotion = accelerationMagnitude > 3.0;
 
   if (!fallCandidate) {
     bool cooldownFinished =
@@ -268,7 +290,7 @@ void checkFall(
       stillStartTime = 0;
 
       Serial.printf(
-        "\n检测到剧烈运动，等待静止确认..."
+        "\n[本地] 检测到冲击（基站口径），等待静止确认..."
         " A=%.2fg G=%.1fdps\n",
         accelerationMagnitude,
         gyroMagnitude
@@ -278,30 +300,31 @@ void checkFall(
     return;
   }
 
-  // 超过3秒仍未满足条件，取消本次检测
-  if (now - fallCandidateTime > 3000) {
+  // 超过观察上限（PENDING_MAX_MS）仍未满足条件，取消本次检测
+  if (now - fallCandidateTime > 4000) {
     fallCandidate = false;
     stillStartTime = 0;
-    Serial.println("未满足跌倒条件，取消报警");
+    Serial.println("[本地] 观察期内未确认，取消（与基站口径一致）");
     return;
   }
 
-  // 第二阶段：判断剧烈运动后是否静止
+  // 第二阶段：判断剧烈运动后是否持续静止（静止带与基站一致）
   bool isStill =
-      accelerationMagnitude > 0.75 &&
-      accelerationMagnitude < 1.25 &&
-      gyroMagnitude < 25.0;
+      accelerationMagnitude > 0.65 &&
+      accelerationMagnitude < 1.35 &&
+      gyroMagnitude < 50.0;
 
   if (isStill) {
     if (stillStartTime == 0) {
       stillStartTime = now;
     }
 
-    // 连续静止0.8秒，确认疑似跌倒
-    if (now - stillStartTime >= 800) {
+    // 连续静止满 STILL_WINDOW_MS，确认疑似跌倒
+    if (now - stillStartTime >= 1500) {
       Serial.println();
       Serial.println("************************");
-      Serial.println("***   疑似跌倒！     ***");
+      Serial.println("*** 疑似跌倒（本地诊断，");
+      Serial.println("*** 正式判定以基站为准）");
       Serial.println("************************");
       Serial.println();
 
@@ -353,9 +376,10 @@ void printMpuData() {
     lastSerialPrintTime = millis();
 
     Serial.printf(
-      "UDP #%u  ax=%.2fg ay=%.2fg az=%.2fg "
+      "UDP #%u fail=%u  ax=%.2fg ay=%.2fg az=%.2fg "
       "gx=%.2f gy=%.2f gz=%.2f dps\n",
       packetSequence,
+      (unsigned)g_udpSendFail,
       ax, ay, az,
       gx, gy, gz
     );
@@ -567,7 +591,16 @@ void checkCaptureCommand() {
       Serial.println(udp.remotePort());
       requestCapture();
     } else {
-      Serial.printf("忽略未知UDP命令，长度=%d\n", packetSize);
+      /*
+       * 8889 对全网开放，未知报文可能高频到达（端口扫描/误配设备）。
+       * 逐条打印会在收包路径上刷屏拖慢采样：限流为每 5 秒最多一条。
+       */
+      static unsigned long lastUnknownPrintMs = 0;
+      if (millis() - lastUnknownPrintMs >= 5000) {
+        lastUnknownPrintMs = millis();
+        Serial.printf("忽略未知UDP命令，长度=%d（每5秒最多提示一次）\n",
+                      packetSize);
+      }
     }
 
     packetSize = udp.parsePacket();
@@ -612,6 +645,7 @@ void setup() {
     Serial.println("照片缓冲区初始化失败");
   }
 
+#if CAMERA_BOOT_ENABLE
   camera_config_t config = {};
 
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -749,8 +783,18 @@ void setup() {
       }
     }
   }
+#else
+  /*
+   * 摄像头关闭（CAMERA_BOOT_ENABLE=0）时的运行路径（README §4/§7/§11）：
+   * 不碰摄像头引脚与 XCLK，不初始化驱动；cameraReady 保持 false，
+   * 抓拍命令仍会接收校验并打印日志（requestCapture 因 cameraReady
+   * 为 false 拒绝取图）。MPU/WiFi/50Hz 推流完全不受影响。
+   */
+  Serial.println("[CAMERA] disabled: hardware unavailable (see README)");
+  Serial.flush();
+#endif
 
-#if defined(LED_GPIO_NUM)
+#if CAMERA_BOOT_ENABLE && defined(LED_GPIO_NUM)
   startupStep("LED: setupLedFlash ENTER");
   setupLedFlash();
   startupStep("LED: setupLedFlash RETURN");
@@ -925,6 +969,7 @@ void setup() {
   Serial.print(":");
   Serial.println(receiverPort);
 
+#if CAMERA_BOOT_ENABLE
   startupStep("HTTP: startCameraServer ENTER");
   startCameraServer();
   startupStep("HTTP: startCameraServer RETURN");
@@ -932,6 +977,17 @@ void setup() {
   Serial.print("Camera Ready! Use 'http://");
   Serial.print(WiFi.localIP());
   Serial.println("' to connect");
+#else
+  /* 摄像头停用：网页服务不启动（没有画面可看），锚点见 README §7 */
+  Serial.println("[HTTP] not started: CAMERA_BOOT_ENABLE=0");
+  Serial.flush();
+#endif
+
+#if !CAMERA_BOOT_ENABLE
+  /* 抓拍链路状态行：命令会照常接收校验，但不会取图/闪灯（README §4） */
+  Serial.println("[CAPTURE] disabled: camera unavailable");
+  Serial.flush();
+#endif
   startupStep("SETUP complete; entering main loop");
 }
 
@@ -944,6 +1000,13 @@ void setup() {
  *
  * 策略：每 3 秒检查一次，连续 6 秒未连上就重新 WiFi.begin()；
  * 重连成功后重新绑定 UDP 8889 命令端口（socket 可能已失效）。
+ *
+ * 关于本函数内的 delay(20)/delay(50)（2026-10-25 评估保留）：
+ *   它们只发生在「链路切换」时刻（掉线重连 / 恢复重绑端口），此时
+ *   数据流本已中断，主循环最多漂移 50ms（丢 1~2 个采样点）无实际
+ *   影响；而 socket 清理与 config->begin 之间的间隔时序是上板验证过
+ *   的修复（c5bd068），在无法编译验证的情况下不改动已验证时序。
+ *   若日后要把 delay 改成 millis() 状态机，须连板回归抓拍端口修复。
  */
 static void wifi_keepalive(void)
 {

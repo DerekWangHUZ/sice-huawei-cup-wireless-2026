@@ -7,7 +7,7 @@
 ## 📌 项目概述
 
 本项目面向无线通信与通感一体前沿技术，设计并实现了一套**通感一体的异构边缘智算系统**：
-* **空口通感一体**：废除外置独立 Wi-Fi 信标，直接复用移动穿戴端回传 IMU 姿态数据的 UDP 射频报文作为空间多径激励源。同一空中数据流，既承担传感器通信功能，又作为 IMU 感知数据的回传通道（Wi-Fi CSI 通感通道已预留接口，本期跌倒判定以六轴 IMU 为主判据）。
+* **空口通感一体**：废除外置独立 Wi-Fi 信标，直接复用移动穿戴端回传 IMU 姿态数据的 UDP 射频报文作为空间多径激励源。同一空中数据流，既承担传感器通信功能，又作为 IMU 感知数据的回传通道（Wi-Fi CSI 采集与方差统计通路见 `firmware/base_station/main/csi_stats.c` / `csi_real.c`，由 `BS_CSI_IMPL` 编译期选择，默认 stub；跌倒判定以六轴 IMU 为主判据，CSI 方差辅助判据默认关闭，待上机标定 sigma_csi 后启用）。
 * **异构边缘计算**：ESP32-S3 担任感知主控与网络中枢，Artix-7 FPGA 负责硬件级快速响应与声光告警，ESP32-CAM 负责事件触发抓拍，实现多层次异构边缘协同。
 
 ---
@@ -22,8 +22,9 @@
 │   ├── base_station/           # [成员 A] ESP32-S3 核心主控工程 (SoftAP / CSI / SD / OLED 多页面)
 │   │   ├── main/               #    固件源码（fall_core 判定核心 / fpga_link+fpga_uplink 双向链路
 │   │   │                       #              / ui_proto / ui_app 多页面 / settings / oled_display
-│   │   │                       #              / csi_stub / sd_log / log_fmt / board_pins）
-│   │   └── tools/offline_test/ #    离线自测与上板发假包工具（无板可跑）
+│   │   │                       #              / csi_stats+csi_stub|csi_real CSI 统计与采集
+│   │   │                       #              / sd_log / log_fmt / board_pins）
+│   │   └── tools/offline_test/ #    离线自测与假包注入工具（无板可跑，双构建）
 │   ├── wearable/               # [成员 B] ESP32-CAM 穿戴标签工程 (MPU6050 / UDP推流 / 抓拍)
 │   │   ├── main/wearable_firmware/ #  Arduino 草图（18B 推流 / UDP 8889 抓拍 / 网页与 /pic）
 │   │   └── tools/udp_receiver.py   #  电脑端 18 字节协议接收与校验
@@ -32,17 +33,17 @@
 │       │                       #              / seg_display / buzzer_ctrl / led_ctrl / top）
 │       ├── constrs/            #    引脚约束
 │       ├── sim/                #    testbench + 无头仿真脚本（run_sim.ps1）
-│       ├── program_bit.tcl     #    JTAG 下载比特流（掉电即失，改完立刻看现象用）
+│       ├── program_bit.tcl     #    JTAG 下载比特流（掉电即失，用于快速验证）
 │       └── program_mcs.tcl     #    固化到板载配置 Flash（掉电不丢；本板上电后需按一次 CONFIG）
 │
-├── algorithm/                  # [成员 C] 算法与数据处理
-│   └── (离线分析脚本与特征提取逻辑)
+├── algorithm/                  # [成员 C] 算法与数据处理（预留，由成员 C 交付）
 │
 ├── hardware/                   # 硬件工程资料
 │   ├── schematics/             # 电气原理图、引脚对应表（基站接线表.md）
 │   └── photos/                 # 硬件实物定妆照与佩戴效果图
 │
 ├── docs/                       # 项目协作规范与参赛文档
+│   ├── CHANGELOG.md            # 架构级变更日志（每条含决策依据/验收证据/未覆盖事项）
 │   ├── 团队分工与异步协作方案.md  # 三人包干范围、自测手段与交付矩阵
 │   ├── 团队协作规范与接口契约.md  # Wi-Fi参数、18字节UDP协议、S3↔FPGA双向帧协议(§四)
 │   ├── 开关按键使用说明书.md      # 面向现场操作者：拨码/键盘/OLED 五页/告警解除/排障
@@ -50,7 +51,7 @@
 │   ├── FPGA实验板资料参考.md     # FPGA 实验板引脚与片上资源约束
 │   └── Vivado工程移植方案.md     # FPGA 工程移植与版本管理方案
 │
-├── data/                       # 标准测试数据集 (样本 CSV)
+├── data/                       # 标准测试数据集（预留，由成员 C 交付）
 │
 ├── .gitignore                  # 忽略构建缓存、Vivado临时文件等
 └── README.md                   # 本说明文件
@@ -87,6 +88,9 @@
 | 补光与闪灯 | 抓拍前点亮板载闪光灯约 150 ms，抓拍后关闭 |
 | 照片查看 `/pic` | 返回最近一次抓拍的照片；无抓拍记录时返回 `404` |
 | 摄像头网页 | 首页、`/status`、`/capture`、`/stream`（端口 81） |
+
+摄像头相关功能由固件宏 `CAMERA_BOOT_ENABLE` 在编译期控制（默认 1 全功能；
+置 0 则跳过摄像头初始化/闪光灯/网页，仅保留推流与命令接收）。
 
 穿戴端以静态地址 `192.168.4.2` 接入基站热点；基站 DHCP 地址池为
 `192.168.4.10 ~ 192.168.4.100`，该地址不会被分配给其它设备。

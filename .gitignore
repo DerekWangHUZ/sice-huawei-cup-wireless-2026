@@ -51,6 +51,8 @@ firmware/base_station/tools/offline_test/data/
 firmware/base_station/tools/offline_test/logs/
 firmware/base_station/tools/offline_test/test_harness.exe
 firmware/base_station/tools/offline_test/test_harness.obj
+firmware/base_station/tools/offline_test/test_harness_posture.exe
+firmware/base_station/tools/offline_test/test_harness_posture.obj
 
 # ==========================================
 # Python 数据处理环境
@@ -85,3 +87,10 @@ Thumbs.db
 .tmp_*.py
 .tmp_camtest/
 .tmp_tmbuild/
+
+# 会话工具目录
+.zcode/
+
+# 本机 IDF 构建驱动脚本（路径为本机 esp-idf/工具链安装位置，不提交；
+# 仓库内的固件构建方式见 firmware/base_station 与 docs/Vivado工程移植方案.md）
+firmware/base_station/build_bs.cmd
