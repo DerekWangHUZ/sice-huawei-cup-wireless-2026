@@ -105,7 +105,8 @@ RTL/约束放在 `rtl/`、`constrs/`，不放 Vivado 生成的 `coprocessor.srcs
 ## 六、范围外事项
 
 - 真实 CSI 的**上机联调与 sigma_csi 标定**（采集与统计通路及判据钩子就绪：
-  `csi_stats.c` 离线单测覆盖，`csi_real.c` 经 `BS_CSI_IMPL=real` 构建验证，
-  默认构建为 stub、CSV 的 `CSI_Variance` 列为 0；
-  上机三步事项见 `csi_stub.h` 头注）
+  `csi_stats.c` 离线单测覆盖，`csi_real.c` 经 `BS_CSI_IMPL=real` 构建验证并已上机
+  排查——驱动 CSI 能力 Kconfig 与 promiscuous 两层已修复，剩余 IDF v6.1 SoftAP
+  的 ESP_FAIL 驱动拒绝待解；默认构建为 stub、CSV 的 `CSI_Variance` 列为 0；
+  详见 `csi_stub.h` 头注与仓库 issue）
 - SD 运行中热插拔的完整重挂载（六脚模块无卡检测脚，靠扇区探活发现拔卡）

@@ -1,7 +1,7 @@
 /*
  * csi_stub.h -- CSI（Channel State Information）对外接口
  *
- * 实现状态（2026-10-25 更新）：
+ * 实现状态：
  *   真实提取【通路已实现、默认未启用】——csi_real.c + csi_stats.c 完成
  *   了"WiFi CSI 回调 -> 子载波幅度方差滑窗 -> csi_get_variance()"的完整
  *   数据通路，并由 main/CMakeLists.txt 的 BS_CSI_IMPL 在编译期选择：
@@ -9,16 +9,26 @@
  *     real        ：csi_real.c，SoftAP 侧采集 LLTF CSI（穿戴端 STA 的
  *                   50Hz 上行包即采集源，回调只对本机收发的帧触发）。
  *
- * 剩余为上机事项（本仓库纯离线验证，未上机）：
- *   1) 确认 S3 AP 模式下 CSI 回调确实触发（csi_ready() 变 true）；
- *   2) 标定 sigma_csi：采集"静止/活动/跌倒躺平"三种状态的
+ * 上机启用前置与已知限制：
+ *   0) 驱动 CSI 能力须开启：sdkconfig 的 CONFIG_ESP_WIFI_CSI_ENABLED=y，
+ *      并在使能前调 esp_wifi_set_promiscuous(true)（v6 起 CSI 与混杂
+ *      模式耦合）；两者缺一，set_csi_config 即被驱动以 ESP_FAIL 拒绝。
+ *      sdkconfig 直接改 y 会被 confgen 回退（机制待查），当前以编译注入
+ *      -DCONFIG_ESP_WIFI_CSI_ENABLED=1 兜底。
+ *   1) 初始化于首帧数据到达时执行（base_station.c 的
+ *      csi_late_init_if_needed）：保证 SoftAP 完全就绪且 STA 在推流。
+ *   2) 已知限制：IDF v6.1 SoftAP 下即便满足 0)/1)，set_csi_config
+ *      仍被驱动以 ESP_FAIL 拒绝（LLTF-only 与 LLTF+HT-LTF 两种配置
+ *      均尝试，未文档化行为）——启用判据前需先解决，跟踪于仓库
+ *      issue；候选路径：v5.5 工具链采集固件 / v6 迁移指南确认。
+ *   3) 标定 sigma_csi：采集"静止/活动/跌倒躺平"三种状态的
  *      CSI_Variance 序列，取分界值填 fall_core.h 的 CSI_FALL_VAR_MAX；
- *   3) 把 fall_core.h 的 CSI_JUDGE_ENABLE 置 1 启用辅助判据
+ *   4) 把 fall_core.h 的 CSI_JUDGE_ENABLE 置 1 启用辅助判据
  *      （契约 §2.2 第三段：跌倒后扰动方差 < sigma_csi）。
  *
- * 历史接入点说明（原 6 步 TODO，现由 csi_real.c/csi_stats.c 落实）：
+ * 接口与实现的对应关系：
  *   1) esp_wifi_set_csi(true) 开启采集            -> csi_init()
- *   2) esp_wifi_set_csi_config() 配置(LLTF only)   -> csi_init()
+ *   2) esp_wifi_set_csi_config() 配置(双组合尝试)  -> csi_init()
  *   3) esp_wifi_set_csi_rx_cb() 注册回调           -> csi_init()
  *   4) csi_info->buf 取子载波复数对算幅度          -> csi_stats_accumulate()
  *   5) 64 子载波幅度方差                            -> csi_stats_commit()

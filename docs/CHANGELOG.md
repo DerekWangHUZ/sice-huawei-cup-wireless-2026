@@ -5,6 +5,52 @@
 
 ---
 
+## [2026-10-31] CSI 上机排查：驱动配置层两层修复 + v6.1 SoftAP ESP_FAIL 坐实
+
+> 目标：打通 real 构建的 SoftAP CSI 采集（sigma_csi 标定的前置）。
+> 结果：驱动配置层问题全部修复；剩余一层为 IDF v6.1 驱动对 SoftAP
+> CSI 的未文档化拒绝（ESP_FAIL），已实测坐实并转仓库 issue 跟踪。
+
+### 一、构建环境修复（本机）
+
+- ESP-IDF python venv 指向的基座解释器 Python 3.14 已被卸载（本机现为
+  3.15.2），venv 启动器失效：pyvenv.cfg 重指 Python315，并以官方 PyPI
+  升级 pydantic/cffi/bitarray/charset-normalizer/cryptography(48)/psutil
+  ——cryptography 须 <49（约束文件），50.x 会被 idf.py 环境检查拒绝。
+- 修复后 `idf.py build` / `flash` 全流程恢复。
+
+### 二、CSI 上机排查（三层定位，前两层已修复）
+
+| 层 | 现象/原因 | 处置 |
+|---|---|---|
+| 1 | `CONFIG_ESP_WIFI_CSI_ENABLED` 未开：WiFi 驱动初始化时 CSI 能力缺失，`set_csi_config` 直接 ESP_FAIL | sdkconfig 置 y——注意直接改 sdkconfig 会被 confgen 回退（生成头文件中符号消失，机制待查），现以编译注入 `-DCONFIG_ESP_WIFI_CSI_ENABLED=1` 兜底 |
+| 2 | v6 起 CSI 与混杂模式耦合：未开 promiscuous 同样 ESP_FAIL | `csi_init()` 内置 `esp_wifi_set_promiscuous(true)`（串口日志 `ic_enable_sniffer` 证实生效） |
+| 3 | 满足 1/2 后 `set_csi_config` 仍 ESP_FAIL：延迟到 SoftAP 完全就绪且 STA 推流中（首帧延迟初始化），LLTF-only 与 LLTF+HT-LTF 两种配置均被拒 | **未解**：v6.1 驱动对 SoftAP CSI 的支持变化（未文档化），转仓库 issue；候选路径为 v5.5 工具链采集固件或 STA 模式方案 |
+
+### 三、源码变更（base_station）
+
+- `csi_init()` 内置 promiscuous 使能 + 两种 CSI 配置组合依序尝试；
+- `base_station.c` CSI 初始化改为**首帧延迟初始化**
+  （`csi_late_init_if_needed`，udp_pose_task 首帧触发）：
+  替代原"esp_wifi_start 后立即初始化"的时序；
+- `csi_stub.h`/`csi_real.c`/`base_station.c` 头注同步为当前事实口径；
+- 失败路径保持 fail-open：CSI 缺失不影响 IMU 主判据，行为与 stub 一致。
+
+### 四、验收证据
+
+- 串口启动日志（COM4）：`ic_enable_sniffer` 证实 promiscuous 生效；
+  `set_csi_config try 1/2 failed: ESP_FAIL` 证实双配置均被拒；
+- 推流链路正常：`STATS packets=219→1972 frames_ok=100% mag=0.99~1.00g`；
+- real 构建编译通过（bin 949,504 B），烧录校验一致。
+
+### 五、未覆盖事项
+
+- SoftAP CSI 的 ESP_FAIL（issue 跟踪）解决前，real 构建的 CSI_Variance
+  列仍为 0，CSI_JUDGE_ENABLE 保持关闭（fail-open）；
+- sigma_csi 三状态标定、姿态门佩戴标定：待 CSI 采集打通后进行。
+
+---
+
 ## [2026-10-26] 摄像头恢复启用 + 全套离线验证收尾 + 文档口径清理
 
 > 三件事：① 摄像头模组恢复可用，`CAMERA_BOOT_ENABLE` 默认翻回 1；

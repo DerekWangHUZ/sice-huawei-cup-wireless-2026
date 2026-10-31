@@ -16,13 +16,18 @@
  * 50Hz 向 SoftAP 持续发包，AP 每收一包即触发一次回调——采集率
  * 与 UDP 包率一致，恰好由 csi_feed_packet() 的调用点天然节流。
  *
- * 上机前必须确认（本期未上机，见 CHANGELOG 2026-10-25）：
- *   1) S3 作为 AP 的 LLTF CSI 回调确实触发（串口看 CSI_INIT ok 与
- *      csi_stats_ready 变 true）；
- *   2) sigma_csi 阈值标定：分别采集"人静止/人走动/跌倒躺平"三种
- *      状态的 CSI_Variance 序列（SD 卡 CSV），取静止与活动分布的
- *      分界，填入 fall_core.h 的 CSI_FALL_VAR_MAX；
- *   3) 标定完成后把 CSI_JUDGE_ENABLE 翻转为 1 启用辅助判据。
+ * 上机要点与已知限制：
+ *   - 驱动 CSI 能力须开启（CONFIG_ESP_WIFI_CSI_ENABLED=y，或编译注入
+ *     该宏），并在本文件初始化时先调 esp_wifi_set_promiscuous(true)
+ *     （v6 起 CSI 与混杂模式耦合）——缺一 set_csi_config 即被以
+ *     ESP_FAIL 拒绝，两者均已内置；
+ *   - 初始化于首帧数据到达时执行（base_station.c 的
+ *     csi_late_init_if_needed），保证 SoftAP 完全就绪且 STA 在推流；
+ *   - 已知限制：IDF v6.1 SoftAP 下即便满足上述两点，set_csi_config
+ *     仍被驱动以 ESP_FAIL 拒绝（LLTF-only 与 LLTF+HT-LTF 均尝试，
+ *     未文档化行为）——启用判据前需先解决，跟踪见仓库 issue；
+ *   - sigma_csi 阈值标定（静止/走动/跌倒躺平三状态）在采集成功后
+ *     进行，取分界填 fall_core.h 的 CSI_FALL_VAR_MAX。
  */
 
 #include "csi_stub.h"
@@ -72,7 +77,30 @@ esp_err_t csi_init(void)
     };
     esp_err_t err;
 
-    err = esp_wifi_set_csi_config(&cfg);
+    /* v6.x 起 CSI 与混杂模式耦合：CSI 系列调用的失败条件明示
+     * "promiscuous mode is not enabled"（esp-csi 例程同样先开
+     * promiscuous）。未开时 set_csi_config 直接被驱动拒绝。 */
+    err = esp_wifi_set_promiscuous(true);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "set_promiscuous failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    /* 两种配置组合依序尝试：A=LLTF-only（保留子载波独立性）；
+     * B=LLTF+HT-LTF+合并（esp-csi 风格默认）。驱动对组合的接受度
+     * 随芯片/驱动版本有差异，任一成功即用。 */
+    wifi_csi_config_t try_cfg[2] = { cfg, cfg };
+    try_cfg[1].htltf_en     = true;
+    try_cfg[1].ltf_merge_en = true;
+
+    for (int i = 0; i < 2; i++) {
+        err = esp_wifi_set_csi_config(&try_cfg[i]);
+        if (err == ESP_OK) {
+            break;
+        }
+        ESP_LOGW(TAG, "set_csi_config try %d failed: %s", i + 1,
+                 esp_err_to_name(err));
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "set_csi_config failed: %s", esp_err_to_name(err));
         return err;

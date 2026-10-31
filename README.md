@@ -7,7 +7,7 @@
 ## 📌 项目概述
 
 本项目面向无线通信与通感一体前沿技术，设计并实现了一套**通感一体的异构边缘智算系统**：
-* **空口通感一体**：废除外置独立 Wi-Fi 信标，直接复用移动穿戴端回传 IMU 姿态数据的 UDP 射频报文作为空间多径激励源。同一空中数据流，既承担传感器通信功能，又作为 IMU 感知数据的回传通道（Wi-Fi CSI 采集与方差统计通路见 `firmware/base_station/main/csi_stats.c` / `csi_real.c`，由 `BS_CSI_IMPL` 编译期选择，默认 stub；跌倒判定以六轴 IMU 为主判据，CSI 方差辅助判据默认关闭，待上机标定 sigma_csi 后启用）。
+* **空口通感一体**：废除外置独立 Wi-Fi 信标，直接复用移动穿戴端回传 IMU 姿态数据的 UDP 射频报文作为空间多径激励源。同一空中数据流，既承担传感器通信功能，又作为 IMU 感知数据的回传通道（Wi-Fi CSI 采集与方差统计通路见 `firmware/base_station/main/csi_stats.c` / `csi_real.c`，由 `BS_CSI_IMPL` 编译期选择，默认 stub；跌倒判定以六轴 IMU 为主判据，CSI 方差辅助判据默认关闭，启用前置（CSI Kconfig/promiscuous/首帧延迟初始化）与 v6.1 SoftAP 限制见 `csi_stub.h` 头注与仓库 issue，sigma_csi 标定后启用）。
 * **异构边缘计算**：ESP32-S3 担任感知主控与网络中枢，Artix-7 FPGA 负责硬件级快速响应与声光告警，ESP32-CAM 负责事件触发抓拍，实现多层次异构边缘协同。
 
 ---
